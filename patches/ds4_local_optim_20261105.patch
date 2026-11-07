@@ -1,0 +1,113 @@
+diff --git a/ds4_metal.m b/ds4_metal.m
+index e970477..03f8a94 100644
+--- a/ds4_metal.m
++++ b/ds4_metal.m
+@@ -50990,6 +50990,14 @@ typedef struct {
+     uint32_t tokens, slots, stride, width, list_cap;
+ } qwen4_moe_half_pass;
+ 
++/* Resident twin of the SSD-streaming half pass.  The streaming wrapper keeps
++ * one of these per call because its expert weights change; a resident graph
++ * keeps a single instance, and only the mid -> down hand-off uses it.  The
++ * element arithmetic is unchanged: the mid shadow already holds the value the
++ * down kernel would have rounded from float. */
++static qwen4_moe_half_pass g_qwen4_resident_half_pass;
++static int g_qwen4_resident_half_on = -1;   /* -1 unchecked, 0 off, 1 on */
++
+ /* Scoped to one routed mid/down call. Indirect cache buffers are registered
+  * on each encoder and protected by the same completion sequence as DeepSeek.
+  * Compact staging supplies private address tables backed by owned payloads;
+@@ -51010,6 +51018,24 @@ typedef struct {
+     qwen4_moe_half_pass *half_pass;
+ } qwen4_stream_weights;
+ static qwen4_stream_weights *g_qwen4_stream_weights;
++
++/* DS4_QWEN4_MOE_HALF_OPERAND=1 turns the resident half-operand pass on for
++ * A/B; the streaming path always supplies its own instance. */
++static qwen4_moe_half_pass *qwen4_moe_active_half_pass(void) {
++    if (g_qwen4_stream_weights && g_qwen4_stream_weights->half_pass)
++        return g_qwen4_stream_weights->half_pass;
++    if (g_qwen4_resident_half_on < 0) {
++        const char *e = getenv("DS4_QWEN4_MOE_HALF_OPERAND");
++        g_qwen4_resident_half_on = e && e[0] && strcmp(e, "0") != 0;
++    }
++    return g_qwen4_resident_half_on ? &g_qwen4_resident_half_pass : NULL;
++}
++
++static void qwen4_moe_clear_half_pass_mid(void) {
++    if (g_qwen4_stream_weights && g_qwen4_stream_weights->half_pass)
++        g_qwen4_stream_weights->half_pass->mid = NULL;
++    g_qwen4_resident_half_pass.mid = NULL;
++}
+ static bool qwen4_moe_mm_legacy_ssd(uint32_t n_tokens, uint32_t type);
+ 
+ static bool qwen4_bind_experts(qwen4_bind *b, const void *map, uint64_t size,
+@@ -51593,8 +51619,13 @@ int ds4_gpu_qwen4_hc_combine_norm_tensor(
+     if (!qwen4_bind_tensor(&b[5], next_R, dim * sizeof(float), "combine norm next R") ||
+         !qwen4_bind_tensor(&b[6], blk, n_embd * sizeof(float), "combine norm block") ||
+         !qwen4_bind_tensor(&b[7], old_inj, n_hc * DS4_QWEN4_HC_CHUNKS * n_hc * sizeof(float), "combine norm old inject")) return 0;
++    /* Single-wave T=1/T=2 steps: the kernel's cost is its own serial walk
++     * over E, so more threads shorten it. Prefill keeps 128 (grid.y already
++     * spans the tokens) and the reduction array is sized for 32 simdgroups. */
++    const uint32_t combine_threads = n_tokens > 8u ? 128u :
++        (uint32_t)ds4_gpu_env_u64("DS4_QWEN4_HC_COMBINE_THREADS", 512u, 32u, 1024u);
+     return qwen4_dispatch(QWEN4_K_HC_COMBINE_NORM, &args, sizeof(args), b, 8,
+-        MTLSizeMake(n_hc * DS4_QWEN4_HC_CHUNKS, 1, 1), MTLSizeMake(128, 1, 1), 0);
++        MTLSizeMake(n_hc * DS4_QWEN4_HC_CHUNKS, 1, 1), MTLSizeMake(combine_threads, 1, 1), 0);
+ }
+ 
+ int ds4_gpu_qwen4_hc_norm_tensor(
+@@ -51643,8 +51674,14 @@ int ds4_gpu_qwen4_hc_norm_tensor(
+     const int kernel = reuse
+         ? qwen4_hc_kernel(weight_type, QWEN4_K_HC_NORM_REUSE_F16, QWEN4_K_HC_NORM_REUSE_F32, QWEN4_K_HC_NORM_REUSE_Q8)
+         : qwen4_hc_kernel(weight_type, QWEN4_K_HC_NORM_F16, QWEN4_K_HC_NORM_F32, QWEN4_K_HC_NORM_Q8);
++    /* The reuse variant sizes its inject partials for four simdgroups.
++     * Prefill keeps 128 threads: measured 128 > 256 > 512 > 1024 on M1 Ultra
++     * (513 / 508 / 496 / 450 t/s at 2048 ctx), so the wide walk helps only
++     * the single-wave decode step. */
++    const uint32_t norm_threads = (reuse || n_tokens > 8u) ? 128u :
++        (uint32_t)ds4_gpu_env_u64("DS4_QWEN4_HC_NORM_THREADS", 512u, 32u, 1024u);
+     return qwen4_dispatch(kernel, &args, sizeof(args), b, 5,
+-                          MTLSizeMake(reuse ? n_hc : n_hc * DS4_QWEN4_HC_CHUNKS, n_tokens, 1), MTLSizeMake(128, 1, 1), 0);
++                          MTLSizeMake(reuse ? n_hc : n_hc * DS4_QWEN4_HC_CHUNKS, n_tokens, 1), MTLSizeMake(norm_threads, 1, 1), 0);
+ }
+ 
+ int ds4_gpu_qwen4_hc_gate_mix_tensor(
+@@ -53126,7 +53163,7 @@ int ds4_gpu_qwen4_moe_mm_mid_tensor(
+         const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset,
+         uint32_t weight_type, uint32_t n_expert, uint32_t n_tokens, uint32_t n_slots, uint32_t n_out,
+         uint32_t in_dim, uint32_t ff_dim, uint32_t list_cap) {
+-    qwen4_moe_half_pass *hp = g_qwen4_stream_weights ? g_qwen4_stream_weights->half_pass : NULL;
++    qwen4_moe_half_pass *hp = qwen4_moe_active_half_pass();
+     if (hp) hp->mid = NULL;
+     const uint32_t row_bytes = qwen4_expert_row_bytes(weight_type, in_dim);
+     const uint64_t expert_bytes = (uint64_t)row_bytes * ff_dim;
+@@ -53155,8 +53192,7 @@ int ds4_gpu_qwen4_moe_mm_mid_tensor(
+     const uint32_t dispatch_experts = qwen4_moe_mm_dispatch_experts(&args);
+     if (dispatch_experts == UINT32_MAX) return 0;
+     if (!dispatch_experts) {
+-        if (g_qwen4_stream_weights && g_qwen4_stream_weights->half_pass)
+-            g_qwen4_stream_weights->half_pass->mid = NULL;
++        qwen4_moe_clear_half_pass_mid();
+         /* No mid rows were produced or consumed. Do not let an unrelated
+          * earlier NAX half-copy association survive this empty pass. */
+         g_qwen4_nax_half_mid_for = NULL;
+@@ -53247,7 +53283,7 @@ int ds4_gpu_qwen4_moe_mm_down_tensor(
+         const void *model_map, uint64_t model_size, uint64_t down_offset,
+         uint32_t weight_type, uint32_t n_expert, uint32_t n_tokens, uint32_t n_slots, uint32_t n_out,
+         uint32_t ff_dim, uint32_t out_dim, uint32_t list_cap) {
+-    qwen4_moe_half_pass *hp = g_qwen4_stream_weights ? g_qwen4_stream_weights->half_pass : NULL;
++    qwen4_moe_half_pass *hp = qwen4_moe_active_half_pass();
+     const qwen4_moe_half_pass producer = hp ? *hp : (qwen4_moe_half_pass){0};
+     if (hp) hp->mid = NULL; /* consume even if validation or dispatch fails */
+     const uint32_t weight_dim = weight_type == 10u ? (ff_dim + 255u) / 256u * 256u : ff_dim;
+@@ -53277,8 +53313,7 @@ int ds4_gpu_qwen4_moe_mm_down_tensor(
+     const uint32_t dispatch_experts = qwen4_moe_mm_dispatch_experts(&args);
+     if (dispatch_experts == UINT32_MAX) return 0;
+     if (!dispatch_experts) {
+-        if (g_qwen4_stream_weights && g_qwen4_stream_weights->half_pass)
+-            g_qwen4_stream_weights->half_pass->mid = NULL;
++        qwen4_moe_clear_half_pass_mid();
+         /* No mid rows were produced or consumed. Do not let an unrelated
+          * earlier NAX half-copy association survive this empty pass. */
+         g_qwen4_nax_half_mid_for = NULL;

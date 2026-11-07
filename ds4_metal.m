@@ -3005,7 +3005,7 @@ static void ds4_gpu_apply_m1_ultra_defaults(void) {
         { "DS4_QWEN4_IDX_PREFILTER",      "1"  },
         { "DS4_QWEN4_ATTN_MERGE_WIDE",    "1"  },
         /* HC / GDN kernels. 512 threads is the measured maximum: 1024 corrupts
-         * the output, see .workbuddy/memory. */
+         * the output, see README.md. */
         { "DS4_QWEN4_HC_MIX_PREFETCH",    "1"  },
         { "DS4_QWEN4_HC_NORM_REUSE",      "1"  },
         { "DS4_QWEN4_GDN_FRONT_THREADS",  "512"},
@@ -51670,7 +51670,7 @@ static int qwen4_icb_enabled(void) {
     if (g_qwen4_icb_enabled < 0) {
         const char *e = getenv("DS4_QWEN4_ICB");
         /* Opt-in only: on this driver an indirect compute command reads
-         * its input buffers as zero (see .workbuddy notes), so the
+         * its input buffers as zero (see the ICB probe notes), so the
          * replay stays an experiment instead of a default. */
         g_qwen4_icb_enabled = e && e[0] && strcmp(e, "0") != 0;
         g_qwen4_icb_one_per_run = getenv("DS4_QWEN4_ICB_ONE") != NULL;

@@ -1,0 +1,82 @@
+diff --git a/ds4_metal.m b/ds4_metal.m
+index e970477..61be2c9 100644
+--- a/ds4_metal.m
++++ b/ds4_metal.m
+@@ -2943,12 +2958,63 @@ static int ds4_gpu_compile_tensor_probe(void) {
+         return 1;
+     }
+ #endif
+     return 0;
+ }
+ 
++/* Upstream gates the Qwen3.8 tuning that was measured on this GPU on M3 Ultra,
++ * M5 and M6 only, so a stock build puts the M1 Ultra back on the generic path:
++ * decode 36.4 -> 29.6 t/s at 2K context and 28.3 -> 20.3 t/s at 256K. Supply the
++ * measured values as environment defaults instead of forking every gate: an
++ * explicitly set variable always wins, so any value stays individually
++ * overridable, and the list survives upstream changes to the gates themselves.
++ * DS4_QWEN4_NO_M1_ULTRA_DEFAULTS=1 turns the whole block off. */
++static void ds4_gpu_apply_m1_ultra_defaults(void) {
++    static int applied = 0;
++    if (applied) return;
++    if (!g_metal_device_name[0]) return;   /* probe not ready yet; retry later */
++    applied = 1;
++    if (!ds4_gpu_device_name_contains("M1 Ultra")) return;
++    const int disabled = ds4_gpu_env_bool("DS4_QWEN4_NO_M1_ULTRA_DEFAULTS");
++    if (disabled > 0) return;
++    static const struct { const char *name, *value; } defaults[] = {
++        /* MoE GEMM: expert-major tile order plus the specialized kernels and
++         * their measured nt / tiles / nsg geometry. */
++        { "DS4_QWEN4_MOE_MM_ORDER",       "1"  },
++        { "DS4_QWEN4_MOE_MM_SPECIALIZE",  "1"  },
++        { "DS4_QWEN4_MOE_MV_SPECIALIZE",  "1"  },
++        { "DS4_QWEN4_MOE_MV_NSG",         "16" },
++        { "DS4_QWEN4_MOE_MV_NR",          "2"  },
++        { "DS4_QWEN4_MOE_MID_TILES",      "24" },
++        { "DS4_QWEN4_MOE_DOWN_TILES",     "8"  },
++        { "DS4_QWEN4_MOE_DOWN_NT",        "2"  },
++        { "DS4_QWEN4_MOE_TAILS",          "1"  },
++        { "DS4_QWEN4_Q4K_MID_NR",         "1"  },
++        /* Q8 prefill: unpack to F16 once per chunk and use the wide GEMM. */
++        { "DS4_QWEN4_Q8_PREFILL_UNPACK",  "1"  },
++        { "DS4_QWEN4_PREFILL_REUSE",      "1"  },
++        /* Qwen sparse-attention indexer: vector scorer + tile-max prefilter. */
++        { "DS4_QWEN4_IDX_SCORE_VEC",      "1"  },
++        { "DS4_QWEN4_IDX_PREFILTER",      "1"  },
++        { "DS4_QWEN4_ATTN_MERGE_WIDE",    "1"  },
++        /* HC / GDN kernels. 512 threads is the measured maximum: 1024 corrupts
++         * the output, see README.md. */
++        { "DS4_QWEN4_HC_MIX_PREFETCH",    "1"  },
++        { "DS4_QWEN4_HC_NORM_REUSE",      "1"  },
++        { "DS4_QWEN4_GDN_FRONT_THREADS",  "512"},
++        { "DS4_QWEN4_GDN_PREFILL_NSG",    "16" },
++        /* Six layers per submission overlaps host encoding with the GPU. */
++        { "DS4_QWEN4_FLUSH_LAYER",        "6"  },
++        /* Resident MoE half-operand pass (needs the local prefill patch). */
++        { "DS4_QWEN4_MOE_HALF_OPERAND",   "1"  },
++    };
++    for (size_t i = 0; i < sizeof(defaults) / sizeof(defaults[0]); i++) {
++        if (!getenv(defaults[i].name)) setenv(defaults[i].name, defaults[i].value, 1);
++    }
++}
++
+ static void ds4_gpu_detect_metal4_features(void) {
+     g_metal4_runtime_available = 0;
+     g_metal4_family_supported = 0;
+     g_metal4_queue_supported = 0;
+     g_metal4_neural_accelerators_hint = 0;
+     g_metal4_tensor_api_enabled = 0;
+@@ -2957,12 +3023,13 @@ static void ds4_gpu_detect_metal4_features(void) {
+ 
+     if (!g_device) return;
+ 
+     const char *name = [[g_device name] UTF8String];
+     if (name) {
+         snprintf(g_metal_device_name, sizeof(g_metal_device_name), "%s", name);
++        ds4_gpu_apply_m1_ultra_defaults();
+     }
+ 
+     const int metal4_disabled = ds4_gpu_env_bool("DS4_METAL_DISABLE_METAL4") > 0;
+ 
+ #if defined(__MAC_OS_X_VERSION_MAX_ALLOWED) && __MAC_OS_X_VERSION_MAX_ALLOWED >= 260000
+     if (@available(macOS 26.0, *)) {

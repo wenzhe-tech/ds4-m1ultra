@@ -103,23 +103,108 @@
 - 其余证伪项：`MTP_DEPTH=3` 手工锁死、`F16_MM_DECODE=1`、`FLUSH_LAYER=1/96`、
   ICB 分块绑定的三种绕法（全部 OOM，因上游刻意用极少数重叠大视图 + 一次性 residency）。
 
-## 7. 复现
+## 7. 参数配置建议
+
+以下都是本机实测 / 查证过源码的结论，不是通用默认值。
+
+### 7.1 采样参数（官方 Qwen3.8 Flash 思考模式）
+
+| 参数 | 官方建议 | ds4 内置默认 | 怎么设置 |
+|---|---:|---:|---|
+| `temperature` | 1.0 | 1.0 | `--temp 1.0`，或请求里传 |
+| `top_p` | 0.95 | **1.0** | `--top-p 0.95` |
+| `top_k` | 20 | **0** | `--top-k 20`（**仅 `ds4-server` 有此开关**，CLI 没有） |
+| `min_p` | 0.0 | **0.05** | `--min-p 0.0` |
+| `presence_penalty` | 0.0 | 不支持 | 传了会被静默忽略，官方值本来就是中性 |
+| `repetition_penalty` | 1.0 | 不支持 | 同上 |
+
+`--temp` / `--top-p` / `--top-k` / `--min-p` 在 `ds4-server` 上是**请求默认值**：
+客户端没传该字段才生效，显式传的值永远优先；启动时打印生效值，`--trace` 会记录每次请求的实际值。
+`--temp 0` 走贪心，以上四个参数全部作废；服务端在工具调用语法内部也强制贪心。
+不同 API 入口支持度不同：`/v1/chat/completions` 和 `/v1/completions` 四个都认，
+`/v1/messages` 认 `top_k` 不认 `min_p`，`/v1/responses` 两个都不认 —— 统一用 chat/completions 最稳。
+
+### 7.2 MTP 投机解码
+
+| 场景 | 怎么开 | 质量 |
+|---|---|---|
+| 任意 ctx + `--temp 0` | `--mtp` | **逐字节无损**（实测 6 次运行 MD5 一致） |
+| `temp > 0`，要严格保持分布 | `--mtp --mtp-exact-sampling` | 分布级无损 |
+| `temp > 0`，只要快 / 更确定 | `--mtp` | 约 80% 位置偷偷变贪心，多样性下降 |
+| 多用户 `--batched-session` + `temp > 0` | 加 exact-sampling 会让投机退回普通批量解码 | 需权衡 |
+
+**建议任何上下文长度都开**：2K 实测 +18.7%，256K 实测 +17.9%，收益与 ctx 基本无关，
+也不增加 KV 占用。
+
+不要加的参数：`--mtp-draft 7` 对 Qwen3.8 **完全无效**（该模型深度由
+`qwen4_spec_depth()` 决定，默认 2、自适应升 3；实测 1 与 7 的 cycle 数、接受率完全相同）；
+`--mtp-timing` 在常驻服务里只在**退出时**打印一行累计值，日常没用；
+`--trace FILE` 每请求写完整原始 JSON + 渲染 prompt + 生成文本（256K 时约 1.8 MB/请求，
+无轮转），只在排障时开；`DS4_QWEN4_MTP_DEPTH=3` 手工锁死在一般文本上反而更慢。
+
+### 7.3 上下文、运行与网络
+
+- `--ctx 262144`：模型 `context_length=262144`，不设 YARN 不外推，写 262144 即可
+  （不用刻意写 260000）。`--ctx` 是**总容量**，prompt 上限恒为 `ctx-1`；
+  改 ctx 会让 KV 磁盘检查点失效（ctx 是查找键的一部分）。
+- `--metal` 在 macOS 上本来就是默认后端，写不写没区别。
+- `-t 16 --warm-weights`：前者给 host 侧辅助线程，后者预热权重减少首个请求卡顿。
+- `--kv-disk-dir DIR --kv-disk-space-mb N`：磁盘 KV 检查点；N 是预算不是预分配。
+- `--host 0.0.0.0 --port 8000` 可让局域网访问；服务端**无认证、无 TLS**，
+  公网请走 Tailscale、cloudflared 或反代 + basic auth，不要直接端口映射。
+- 仓库不含任何模型权重，需自备文本 GGUF；视觉功能另需 `--vision FILE` 指向 mmproj。
+
+### 7.4 环境变量
+
+M1 Ultra 的 21 个 `DS4_QWEN4_*` 调优默认值在 `ds4_gpu_detect_metal4_features()` 里
+**按设备名自动注入**，无需手动设置；显式设置的变量优先，
+`DS4_QWEN4_NO_M1_ULTRA_DEFAULTS=1` 可整体关闭。完整开关清单见 `tools/env_best.txt`
+（非 M1 Ultra 机型可参考，但未验证）。
+
+两个禁忌：`DS4_QWEN4_GDN_FRONT_THREADS=1024` 会输出乱码（用 512）；
+`DS4_QWEN4_ICB=1` 会输出乱码（32 位绑定偏移截断），默认关闭，别开。
+
+## 8. 仓库里有什么 / 别人怎么用
+
+`clone` 默认分支 `main` 拿到的**就是优化后的源码**，但要满足几个条件：
+
+1. **必须自己编译**：仓库不含二进制，`make clean && make -j4`
+   （Makefile 无头文件依赖追踪，更新后只跑 `make` 会留下按旧头文件编译的 `.o`）。
+2. **自动优化只对 M1 Ultra 生效**：默认值注入按 GPU 设备名判断，其他机型走上游路径，
+   不会自动拿到这些调优值。
+3. **模型自备**：文本 GGUF 与视觉 mmproj 均不在仓库内。
+4. **服务端采样默认值不是自动的**：`ds4-server` 若不传那四个 flag，仍是上游的
+   `1.0 / 1.0 / 0 / 0.05`；按 7.1 显式传，或直接跑 `./tools/server-tuned.sh`。
+
+目录说明：
+
+| 路径 | 内容 |
+|---|---|
+| `patches/` | 4 个 format-patch：`m1_ultra_defaults`（21 个默认值）、`ds4_local_optim_20261105`（Metal 内核）、`server_sampling_defaults`（服务端四个参数）、`local_all_b3f5018`（全量快照） |
+| `tools/` | `apply_m1_defaults.sh`（幂等补默认值）、`update_ds4.sh`（幂等快进上游 + 全量重编译）、`server-tuned.sh`（一键启动器）、`env_best.txt`（21 个开关）、`icb/`（ICB 驱动探测器） |
+
+从上游更新后的固定流程：
 
 ```sh
-make clean && make -j4        # Makefile 无头文件依赖追踪，更新后必须 clean
-./ds4 -m ds4flash.gguf --metal -t 16 --warm-weights --ctx 262144 \
-      --mtp --temp 0
-
-# 服务端：官方思考模式采样默认值 + 严格保分布的投机解码
-./ds4-server -m ds4flash.gguf --metal -t 16 --ctx 262144 \
-      --mtp --mtp-exact-sampling \
-      --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0
+./tools/update_ds4.sh          # 快进 upstream，自动备份本地改动、make clean && make -j4
+./tools/apply_m1_defaults.sh   # 重新注入 M1 Ultra 默认值（幂等，已应用则跳过）
 ```
 
-从上游更新后，需要重新应用本地默认值补丁，否则 decode 会从 36.4 掉回 29.6，
-262K 时从 28.3 掉到 20.3。补丁与幂等脚本保存在本机，未纳入本仓库。
+漏掉第二步会静默变慢：decode 36.4 → 29.6，256K 时 28.3 → 20.3。
 
-## 8. 许可
+一键启动（等价 7.1 + 7.2 + 7.3 的推荐组合）：
+
+```sh
+./tools/server-tuned.sh        # 可用 CTX/PORT/SAMP_TOP_P/SAMP_EXACT 等环境变量覆盖
+```
+
+单次运行的验证命令：
+
+```sh
+./ds4 -m ds4flash.gguf --metal -t 16 --warm-weights --ctx 262144 --mtp --temp 0
+```
+
+## 9. 许可
 
 上游 [antirez/ds4](https://github.com/antirez/ds4) 为 MIT，`LICENSE` 原样保留。
 本分支的本地改动同样按 MIT 提供。
