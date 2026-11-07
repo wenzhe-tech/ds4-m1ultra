@@ -60527,6 +60527,12 @@ static bool qwen4_gemv_rows(ds4_gpu_tensor *out, const ds4_model *m, const ds4_t
     const bool legacy = getenv("DS4_QWEN4_DENSE_MM_LEGACY") != NULL;
     const bool f16_batch = !legacy && n_tok > 3u && w->type == DS4_TENSOR_F16 &&
         n_tok <= 64u && (out_dim <= 512u || n_tok > 8u);
+    if (w->type == DS4_TENSOR_F32 && n_tok >= 256u && (in_dim % 32u) == 0 && (out_dim % 64u) == 0 &&
+        getenv("DS4_QWEN4_NO_ROUTER_MM") == NULL) {
+        rc = ds4_gpu_qwen4_f32_mm_tensor(out, x, m->map, m->size, w->abs_offset,
+                                         n_tok, (uint32_t)in_dim, (uint32_t)out_dim);
+        if (rc) return true;
+    }
     if (((n_tok > 8u && w->type == DS4_TENSOR_F32) || f16_batch) &&
         (in_dim % 32) == 0) {
         rc = ds4_gpu_qwen4_dense_mm_tensor(out, x, m->map, m->size, w->abs_offset, w->type, n_tok,
@@ -60657,6 +60663,20 @@ static bool qwen4_graph_fused(const ds4_qwen4_gpu_graph *g, uint32_t T) {
     return T == 3u && g->verify_rows_exact;
 }
 
+/* Decode-fusion halves can be disabled one at a time: the paired Q8_0
+ * qkv+gate matvec and the fused hc combine+norm. Kept as A/B switches so the
+ * per-half cost stays measurable. */
+static bool qwen4_decode_pair_gemv(void) {
+    static int enabled = -1;
+    if (enabled < 0) enabled = getenv("DS4_QWEN4_NO_PAIR_GEMV") == NULL;
+    return enabled && ds4_gpu_qwen4_decode_fusions_enabled();
+}
+static bool qwen4_decode_hc_combine_norm(void) {
+    static int enabled = -1;
+    if (enabled < 0) enabled = getenv("DS4_QWEN4_NO_HC_COMBINE_NORM") == NULL;
+    return enabled && ds4_gpu_qwen4_decode_fusions_enabled();
+}
+
 static uint32_t qwen4_mtp_draft_rows(void) {
     /* read per cycle so the A/B harnesses can switch it per step */
     const char *env = getenv("DS4_QWEN4_MTP_DRAFT_ROWS");
@@ -60722,7 +60742,7 @@ static bool qwen4_graph_linear(ds4_qwen4_gpu_graph *g, const ds4_model *m, const
                                uint32_t il, uint32_t T) {
     const uint32_t conv_dim = DS4_N_LIN_CONV_DIM;
     bool paired = false;
-    if (T == 1u && !g->mtp_R && ds4_gpu_qwen4_decode_fusions_enabled() &&
+    if (T == 1u && !g->mtp_R && qwen4_decode_pair_gemv() &&
         l->lin_qkv->type == DS4_TENSOR_Q8_0 && l->lin_gate->type == DS4_TENSOR_Q8_0) {
         paired = ds4_gpu_qwen4_q8_pair_tensor(g->qkv, g->z, m->map, m->size,
             l->lin_qkv->abs_offset, l->lin_gate->abs_offset, DS4_N_EMBD,
@@ -61377,10 +61397,18 @@ static bool qwen4_graph_forward_tokens_impl(ds4_qwen4_gpu_graph *g,
     const double t1 = timing ? now_sec() : 0.0;
     if (!glm_graph_begin_commands_if_needed()) return false;
     bool ok = true;
+    /* One token per step means the next ~800 dispatches repeat the ones the
+     * first decode step recorded, so they replay from an indirect command
+     * buffer instead of being encoded again. */
+    ds4_gpu_qwen4_replay_set(T == 1u && !g->mtp_R && !all_rows);
     /* DS4_QWEN4_TIMING=2 on prefill batches: sync after each stage group and
      * report GPU ms per group (adds sync overhead; diagnostics only) */
     double prof[6] = {0};
-    const bool prof_on = timing == 2 && T > 1u;
+    /* Decode stages are single-token, so the historical gate (T > 1) kept the
+     * breakdown off the one path that needs it.  DS4_QWEN4_TIMING_DECODE=1
+     * opts decode in; each boundary syncs, so the absolute ms are inflated but
+     * the split is the useful part. */
+    const bool prof_on = timing == 2 && (T > 1u || getenv("DS4_QWEN4_TIMING_DECODE") != NULL);
     double prof_last = prof_on ? now_sec() : 0.0;
 #define QWEN4_PROF(idx_) do { \
         if (prof_on) { \
@@ -61424,7 +61452,7 @@ static bool qwen4_graph_forward_tokens_impl(ds4_qwen4_gpu_graph *g,
             ok = qwen4_graph_apply_steering_attn(g, il, T);
         }
         QWEN4_PROF(ds4_qwen4_layer_is_linear(il) ? 2 : 3);
-        if (T == 1u && !g->mtp_R && DS4_N_HC == 4u && ds4_gpu_qwen4_decode_fusions_enabled() &&
+        if (T == 1u && !g->mtp_R && DS4_N_HC == 4u && qwen4_decode_hc_combine_norm() &&
             l->hc_ffn_inject->type == DS4_TENSOR_F16) {
             if (ok) ok = ds4_gpu_qwen4_hc_combine_norm_tensor(g->hc_u, g->blk, g->inj,
                 g->xn, g->inj_alt, g->R, m->map, m->size, l->hc_ffn_norm->abs_offset,
@@ -61459,11 +61487,14 @@ static bool qwen4_graph_forward_tokens_impl(ds4_qwen4_gpu_graph *g,
             ok = ds4_gpu_flush_commands() != 0;
     }
     if (prof_on) {
-        fprintf(stderr, "ds4: Qwen3.8 prefill stage ms/chunk (pos=%u T=%u ok=%d): "
-                "ple %.1f hc_attn %.1f gdn %.1f attn %.1f hc_ffn %.1f moe %.1f\n",
-                pos0, T, ok ? 1 : 0, 1000.0 * prof[0], 1000.0 * prof[1],
-                1000.0 * prof[2], 1000.0 * prof[3], 1000.0 * prof[4], 1000.0 * prof[5]);
+        fprintf(stderr, "ds4: Qwen3.8 %s stage ms/chunk (pos=%u T=%u ok=%d): "
+                "ple %.2f hc_attn %.2f gdn %.2f attn %.2f hc_ffn %.2f moe %.2f\n",
+                T > 1u ? "prefill" : "decode", pos0, T, ok ? 1 : 0,
+                1000.0 * prof[0], 1000.0 * prof[1], 1000.0 * prof[2],
+                1000.0 * prof[3], 1000.0 * prof[4], 1000.0 * prof[5]);
     }
+    /* The head projections below are ordinary encoded dispatches again. */
+    ds4_gpu_qwen4_replay_set(0);
 #undef QWEN4_PROF
     if (ok && logits_out && all_rows) {
         ok = qwen4_graph_hc_mix(g, m, w->output_hc_norm, w->output_hc_down, w->output_hc_up, NULL, T) &&

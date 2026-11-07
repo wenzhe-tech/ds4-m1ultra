@@ -209,14 +209,22 @@ static void print_sampling(FILE *fp, const help_colors *c, bool full, ds4_help_t
     opt(fp, c, "-n, --tokens N", "Maximum generated tokens.");
     opt(fp, c, "--temp F", "Sampling temperature. 0 is greedy/deterministic.");
     opt(fp, c, "--top-p F", "Nucleus sampling probability.");
-    opt(fp, c, "--min-p F", "Keep tokens scoring at least F times the top token.");
-    opt(fp, c, "--seed N", "Sampling seed for reproducible non-greedy runs.");
-    para(fp, c, "GLM CLI and agent runs default to temperature 1.0, top-p 0.95, and min-p 0 unless those options are set explicitly.");
-    opt(fp, c, "--think", "Use normal thinking mode (V4.1: effort 75).");
-    opt(fp, c, "--think-max", "Use maximum thinking (V4.1: 100; V4: requires ctx >= 393216).");
-    if (tool == DS4_HELP_DS4 || tool == DS4_HELP_AGENT)
-        opt(fp, c, "--think-level N", "V4.1 thinking effort, 1..100; 0 disables thinking.");
-    opt(fp, c, "--nothink", "Disable thinking and ask for direct replies.");
+    if (tool == DS4_HELP_SERVER) {
+        opt(fp, c, "--top-k N", "Keep only the N best tokens. 0 disables. Default: 0");
+        opt(fp, c, "--min-p F", "Keep tokens scoring at least F times the top token.");
+        para(fp, c, "On ds4-server these four options set the defaults for request fields the client leaves out; an explicit request value always wins. The effective defaults are logged at startup, and per-request values appear in --trace output.");
+    } else {
+        opt(fp, c, "--min-p F", "Keep tokens scoring at least F times the top token.");
+    }
+    if (tool != DS4_HELP_SERVER) {
+        opt(fp, c, "--seed N", "Sampling seed for reproducible non-greedy runs.");
+        para(fp, c, "GLM CLI and agent runs default to temperature 1.0, top-p 0.95, and min-p 0 unless those options are set explicitly.");
+        opt(fp, c, "--think", "Use normal thinking mode (V4.1: effort 75).");
+        opt(fp, c, "--think-max", "Use maximum thinking (V4.1: 100; V4: requires ctx >= 393216).");
+        if (tool == DS4_HELP_DS4 || tool == DS4_HELP_AGENT)
+            opt(fp, c, "--think-level N", "V4.1 thinking effort, 1..100; 0 disables thinking.");
+        opt(fp, c, "--nothink", "Disable thinking and ask for direct replies.");
+    }
     if (full) {
         opt(fp, c, "-sys, --system TEXT", "System prompt. Empty string disables the default where supported.");
         opt(fp, c, "-p, --prompt TEXT", "One-shot prompt text.");
@@ -427,7 +435,8 @@ static bool tool_has_topic(ds4_help_tool tool, const char *topic) {
     if (streq(topic, "all")) return true;
     if (streq(topic, "runtime") || streq(topic, "distributed")) return true;
     if (streq(topic, "sampling"))
-        return tool == DS4_HELP_DS4 || tool == DS4_HELP_AGENT || tool == DS4_HELP_EVAL;
+        return tool == DS4_HELP_DS4 || tool == DS4_HELP_SERVER ||
+               tool == DS4_HELP_AGENT || tool == DS4_HELP_EVAL;
     if (streq(topic, "steering"))
         return tool == DS4_HELP_DS4 || tool == DS4_HELP_SERVER || tool == DS4_HELP_AGENT;
     switch (tool) {
@@ -581,6 +590,7 @@ static void print_default(FILE *fp, const help_colors *c, ds4_help_tool tool) {
         print_sampling(fp, c, false, tool);
     } else if (tool == DS4_HELP_SERVER) {
         print_server_api(fp, c);
+        print_sampling(fp, c, false, tool);
         print_kv_cache(fp, c);
     } else if (tool == DS4_HELP_AGENT) {
         print_agent_specific(fp, c);

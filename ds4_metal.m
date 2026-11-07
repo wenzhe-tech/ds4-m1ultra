@@ -1340,7 +1340,24 @@ static NSUInteger ds4_gpu_tensor_offset(const ds4_gpu_tensor *tensor) {
 }
 
 static id<MTLCommandBuffer> ds4_gpu_new_command_buffer(void);
+static void ds4_mm_stat_note(uint64_t in_dim, uint64_t out_dim, uint64_t n_tok);
+static void ds4_acc_note(const char *name, double flops);
 static void ds4_gpu_stream_expert_cache_note_owned_created(void);
+static void qwen4_icb_pending_flush(void);
+/* ICB replay cannot bind past this offset: the command keeps 32 bits. */
+#define QWEN4_ICB_MAX_OFFSET   0xFFFFFFFFull
+static int g_qwen4_icb_draining;
+static int g_qwen4_icb_one_per_run;
+static const char *g_qwen4_icb_only;
+static int g_qwen4_icb_also;
+static int g_qwen4_icb_debug;
+static int g_qwen4_icb_dbg_n;
+static int g_qwen4_icb_reason_n;
+/* Set when a command cannot be recorded. Everything after it is encoded
+ * normally for the rest of the step: recording past a gap would shift the
+ * indices, and a shifted slot can match an identical-looking neighbour and
+ * silently skip real work (or run a command against the wrong buffers). */
+static int g_qwen4_icb_capped;
 
 static id<MTLCommandBuffer> ds4_gpu_command_buffer(int *owned) {
     if (g_batch_cb) {
@@ -1355,6 +1372,9 @@ static id<MTLCommandBuffer> ds4_gpu_command_buffer(int *owned) {
 
 static id<MTLComputeCommandEncoder> ds4_gpu_compute_encoder(id<MTLCommandBuffer> cb) {
     if (g_batch_cb && cb == g_batch_cb) {
+        /* Drain a pending replay range before anything else reaches this
+         * encoder, so replayed commands keep their position in the stream. */
+        if (!g_qwen4_icb_draining) qwen4_icb_pending_flush();
         g_batch_has_work = YES;
         if (g_timeline_enabled && g_timeline_batch) {
             /* Diagnostic: one timestamped pass per dispatch group. A
@@ -1387,6 +1407,9 @@ static void ds4_gpu_end_compute_encoder(id<MTLCommandBuffer> cb, id<MTLComputeCo
 }
 
 static void ds4_gpu_close_batch_encoder(void) {
+    /* A pending replay range lives in this encoder; execute it before the
+     * pass closes, creating the encoder when nothing else has yet. */
+    if (g_batch_cb) qwen4_icb_pending_flush();
     if (!g_batch_enc) return;
     [g_batch_enc endEncoding];
     g_batch_enc = nil;
@@ -2946,6 +2969,57 @@ static int ds4_gpu_compile_tensor_probe(void) {
     return 0;
 }
 
+/* Upstream gates the Qwen3.8 tuning that was measured on this GPU on M3 Ultra,
+ * M5 and M6 only, so a stock build puts the M1 Ultra back on the generic path:
+ * decode 36.4 -> 29.6 t/s at 2K context and 28.3 -> 20.3 t/s at 256K. Supply the
+ * measured values as environment defaults instead of forking every gate: an
+ * explicitly set variable always wins, so any value stays individually
+ * overridable, and the list survives upstream changes to the gates themselves.
+ * DS4_QWEN4_NO_M1_ULTRA_DEFAULTS=1 turns the whole block off. */
+static void ds4_gpu_apply_m1_ultra_defaults(void) {
+    static int applied = 0;
+    if (applied) return;
+    if (!g_metal_device_name[0]) return;   /* probe not ready yet; retry later */
+    applied = 1;
+    if (!ds4_gpu_device_name_contains("M1 Ultra")) return;
+    const int disabled = ds4_gpu_env_bool("DS4_QWEN4_NO_M1_ULTRA_DEFAULTS");
+    if (disabled > 0) return;
+    static const struct { const char *name, *value; } defaults[] = {
+        /* MoE GEMM: expert-major tile order plus the specialized kernels and
+         * their measured nt / tiles / nsg geometry. */
+        { "DS4_QWEN4_MOE_MM_ORDER",       "1"  },
+        { "DS4_QWEN4_MOE_MM_SPECIALIZE",  "1"  },
+        { "DS4_QWEN4_MOE_MV_SPECIALIZE",  "1"  },
+        { "DS4_QWEN4_MOE_MV_NSG",         "16" },
+        { "DS4_QWEN4_MOE_MV_NR",          "2"  },
+        { "DS4_QWEN4_MOE_MID_TILES",      "24" },
+        { "DS4_QWEN4_MOE_DOWN_TILES",     "8"  },
+        { "DS4_QWEN4_MOE_DOWN_NT",        "2"  },
+        { "DS4_QWEN4_MOE_TAILS",          "1"  },
+        { "DS4_QWEN4_Q4K_MID_NR",         "1"  },
+        /* Q8 prefill: unpack to F16 once per chunk and use the wide GEMM. */
+        { "DS4_QWEN4_Q8_PREFILL_UNPACK",  "1"  },
+        { "DS4_QWEN4_PREFILL_REUSE",      "1"  },
+        /* Qwen sparse-attention indexer: vector scorer + tile-max prefilter. */
+        { "DS4_QWEN4_IDX_SCORE_VEC",      "1"  },
+        { "DS4_QWEN4_IDX_PREFILTER",      "1"  },
+        { "DS4_QWEN4_ATTN_MERGE_WIDE",    "1"  },
+        /* HC / GDN kernels. 512 threads is the measured maximum: 1024 corrupts
+         * the output, see .workbuddy/memory. */
+        { "DS4_QWEN4_HC_MIX_PREFETCH",    "1"  },
+        { "DS4_QWEN4_HC_NORM_REUSE",      "1"  },
+        { "DS4_QWEN4_GDN_FRONT_THREADS",  "512"},
+        { "DS4_QWEN4_GDN_PREFILL_NSG",    "16" },
+        /* Six layers per submission overlaps host encoding with the GPU. */
+        { "DS4_QWEN4_FLUSH_LAYER",        "6"  },
+        /* Resident MoE half-operand pass (needs the local prefill patch). */
+        { "DS4_QWEN4_MOE_HALF_OPERAND",   "1"  },
+    };
+    for (size_t i = 0; i < sizeof(defaults) / sizeof(defaults[0]); i++) {
+        if (!getenv(defaults[i].name)) setenv(defaults[i].name, defaults[i].value, 1);
+    }
+}
+
 static void ds4_gpu_detect_metal4_features(void) {
     g_metal4_runtime_available = 0;
     g_metal4_family_supported = 0;
@@ -2960,6 +3034,7 @@ static void ds4_gpu_detect_metal4_features(void) {
     const char *name = [[g_device name] UTF8String];
     if (name) {
         snprintf(g_metal_device_name, sizeof(g_metal_device_name), "%s", name);
+        ds4_gpu_apply_m1_ultra_defaults();
     }
 
     const int metal4_disabled = ds4_gpu_env_bool("DS4_METAL_DISABLE_METAL4") > 0;
@@ -13274,6 +13349,12 @@ static id<MTLBuffer> ds4_gpu_wrap_model_range(
         const uint64_t view_start = g_model_views[i].model_offset;
         const uint64_t view_end = view_start + g_model_views[i].bytes;
         if (offset >= view_start && end <= view_end) {
+            /* Bindings stay on the single mapped view: an indirect command
+             * keeps only the low 32 bits of a binding offset, so replay cannot
+             * reach past 4 GiB, but splitting the mapping into per-gibibyte
+             * views costs one resident copy of the model per view and runs the
+             * GPU out of memory. Replay therefore stays off until the model is
+             * mapped as several small buffers at load time. */
             *inner_offset = offset - view_start;
             return g_model_views[i].buffer;
         }
@@ -20383,6 +20464,8 @@ static int ds4_gpu_matmul_q8_0_legacy_tensor(
         ds4_gpu_mul_mm_args args =
             ds4_gpu_make_mm_args(in_dim, out_dim, generic_rows, mat_row_bytes);
 
+        ds4_mm_stat_note(in_dim, out_dim, generic_rows);
+
         id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
         [enc setComputePipelineState:pipeline];
         [enc setBytes:&args length:sizeof(args) atIndex:0];
@@ -20990,6 +21073,8 @@ static int ds4_gpu_matmul_quant_impl_tensor(
         if (!pipeline) return 0;
 
         ds4_gpu_mul_mm_args args = ds4_gpu_make_mm_args(in_dim, out_dim, n_tok, row_bytes);
+
+        ds4_mm_stat_note(in_dim, out_dim, n_tok);
 
         id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
         [enc setComputePipelineState:pipeline];
@@ -21973,6 +22058,85 @@ int ds4_gpu_shared_gate_up_swiglu_q8_0_rows_scalar_tensor(
     return 1;
 }
 
+/* Prefill GEMM shape histogram. The tiled matmul kernels all land at roughly the
+ * same TFLOP/s, which is either a weight-bandwidth limit (a wider token tile
+ * fixes it) or an issue/occupancy limit (it does not). Counting the shapes and
+ * the routed-expert FLOPs lets the two be told apart offline. */
+#define DS4_MM_STAT_MAX 64
+#define DS4_ACC_STAT_MAX 16
+static struct {
+    uint64_t in_dim, out_dim, n_tok, calls;
+} g_mm_stat[DS4_MM_STAT_MAX];
+static struct {
+    const char *name;
+    double flops;
+    uint64_t calls;
+} g_acc_stat[DS4_ACC_STAT_MAX];
+static int g_mm_stat_count;
+static int g_acc_stat_count;
+static int g_mm_stat_enabled = -1;
+
+static void ds4_mm_stat_dump(void) {
+    for (int i = 0; i < g_mm_stat_count; i++) {
+        const uint64_t m = g_mm_stat[i].out_dim;
+        const uint64_t k = g_mm_stat[i].in_dim;
+        const uint64_t n = g_mm_stat[i].n_tok;
+        const uint64_t c = g_mm_stat[i].calls;
+        const double flops = 2.0 * (double)m * (double)k * (double)n * (double)c;
+        const double weight_bytes = 2.0 * (double)m * (double)k * (double)c *
+            ceil((double)n / 32.0);
+        fprintf(stderr, "mmstat k=%llu m=%llu n=%llu calls=%llu tflops=%.2f wbytes=%.2fGB\n",
+                (unsigned long long)k, (unsigned long long)m, (unsigned long long)n,
+                (unsigned long long)c, flops / 1e12, weight_bytes / 1e9);
+    }
+    for (int i = 0; i < g_acc_stat_count; i++) {
+        fprintf(stderr, "accstat %s calls=%llu tflops=%.2f\n", g_acc_stat[i].name,
+                (unsigned long long)g_acc_stat[i].calls, g_acc_stat[i].flops / 1e12);
+    }
+}
+
+static int ds4_stat_enabled(void) {
+    if (g_mm_stat_enabled < 0) {
+        const char *e = getenv("DS4_QWEN4_MM_STATS");
+        g_mm_stat_enabled = e && e[0] && strcmp(e, "0") != 0;
+        if (g_mm_stat_enabled) atexit(ds4_mm_stat_dump);
+    }
+    return g_mm_stat_enabled;
+}
+
+static void ds4_mm_stat_note(uint64_t in_dim, uint64_t out_dim, uint64_t n_tok) {
+    if (!ds4_stat_enabled()) return;
+    for (int i = 0; i < g_mm_stat_count; i++) {
+        if (g_mm_stat[i].in_dim == in_dim && g_mm_stat[i].out_dim == out_dim &&
+            g_mm_stat[i].n_tok == n_tok) {
+            g_mm_stat[i].calls++;
+            return;
+        }
+    }
+    if (g_mm_stat_count >= DS4_MM_STAT_MAX) return;
+    g_mm_stat[g_mm_stat_count].in_dim = in_dim;
+    g_mm_stat[g_mm_stat_count].out_dim = out_dim;
+    g_mm_stat[g_mm_stat_count].n_tok = n_tok;
+    g_mm_stat[g_mm_stat_count].calls = 1;
+    g_mm_stat_count++;
+}
+
+static void ds4_acc_note(const char *name, double flops) {
+    if (!ds4_stat_enabled()) return;
+    for (int i = 0; i < g_acc_stat_count; i++) {
+        if (g_acc_stat[i].name == name) {
+            g_acc_stat[i].flops += flops;
+            g_acc_stat[i].calls++;
+            return;
+        }
+    }
+    if (g_acc_stat_count >= DS4_ACC_STAT_MAX) return;
+    g_acc_stat[g_acc_stat_count].name = name;
+    g_acc_stat[g_acc_stat_count].flops = flops;
+    g_acc_stat[g_acc_stat_count].calls = 1;
+    g_acc_stat_count++;
+}
+
 static int ds4_gpu_matmul_f16_tensor_impl(
         ds4_gpu_tensor       *out,
         const void             *model_map,
@@ -22165,6 +22329,8 @@ static int ds4_gpu_matmul_f16_tensor_impl(
         if (!pipeline) return 0;
 
         ds4_gpu_mul_mm_args args = ds4_gpu_make_mm_args(in_dim, out_dim, n_tok, row_bytes);
+
+        ds4_mm_stat_note(in_dim, out_dim, n_tok);
 
         id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
         [enc setComputePipelineState:pipeline];
@@ -23049,6 +23215,54 @@ int ds4_gpu_matmul_f32_plan_tensor(
         uint64_t                plan_tok) {
     return ds4_gpu_matmul_f32_impl(out, model_map, model_size, weight_offset,
                                    in_dim, out_dim, x, n_tok, plan_tok > n_tok ? plan_tok : n_tok);
+}
+
+/* Qwen's prefill router is a narrow F32 projection (2560 -> 512). The
+ * per-token F32 path leaves most of the grid idle at that shape, so batches
+ * large enough to fill the tile grid take the shared F32 tensor GEMM instead.
+ * DS4_QWEN4_NO_ROUTER_MM=1 keeps the per-token kernel for A/B. */
+int ds4_gpu_qwen4_f32_mm_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
+                                const void *model_map, uint64_t model_size, uint64_t weight_offset,
+                                uint32_t n_tok, uint32_t in_dim, uint32_t out_dim) {
+    if (n_tok < 256u || in_dim == 0 || out_dim == 0 || (in_dim % 32u) != 0 || (out_dim % 64u) != 0) return 0;
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    @autoreleasepool {
+        id<MTLBuffer> xbuf = ds4_gpu_tensor_buffer(x);
+        id<MTLBuffer> outbuf = ds4_gpu_tensor_buffer(out);
+        const uint64_t row_bytes = (uint64_t)in_dim * sizeof(float);
+        const uint64_t weight_bytes = row_bytes * out_dim;
+        if (!xbuf || !outbuf ||
+            ds4_gpu_tensor_bytes(x) < (uint64_t)n_tok * row_bytes ||
+            ds4_gpu_tensor_bytes(out) < (uint64_t)n_tok * out_dim * sizeof(float)) {
+            return 0;
+        }
+        if (weight_offset > model_size || weight_bytes > model_size - weight_offset) return 0;
+        uint64_t inner_offset = 0;
+        id<MTLBuffer> wbuf = ds4_gpu_wrap_model_range(model_map, model_size,
+                                                     weight_offset, weight_bytes, &inner_offset);
+        if (!wbuf) return 0;
+        const bool bc_out = (n_tok % 32u) != 0;
+        id<MTLComputePipelineState> pipeline =
+            ds4_gpu_get_mul_mm_pipeline("kernel_mul_mm_f32_f32_full", false, bc_out);
+        if (!pipeline) return 0;
+        ds4_gpu_mul_mm_args args = ds4_gpu_make_mm_args(in_dim, out_dim, n_tok, row_bytes);
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        if (!enc) return 0;
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
+        [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
+        [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
+        [enc setThreadgroupMemoryLength:12288u atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)n_tok + 31u) / 32u,
+                                              (NSUInteger)out_dim / 64u, 1)
+             threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        return ds4_gpu_finish_command_buffer(cb, owned, "Qwen F32 prefill matmul");
+    }
 }
 
 static int ds4_gpu_matmul_f32_impl(
@@ -50990,6 +51204,14 @@ typedef struct {
     uint32_t tokens, slots, stride, width, list_cap;
 } qwen4_moe_half_pass;
 
+/* Resident twin of the SSD-streaming half pass.  The streaming wrapper keeps
+ * one of these per call because its expert weights change; a resident graph
+ * keeps a single instance, and only the mid -> down hand-off uses it.  The
+ * element arithmetic is unchanged: the mid shadow already holds the value the
+ * down kernel would have rounded from float. */
+static qwen4_moe_half_pass g_qwen4_resident_half_pass;
+static int g_qwen4_resident_half_on = -1;   /* -1 unchecked, 0 off, 1 on */
+
 /* Scoped to one routed mid/down call. Indirect cache buffers are registered
  * on each encoder and protected by the same completion sequence as DeepSeek.
  * Compact staging supplies private address tables backed by owned payloads;
@@ -51010,6 +51232,24 @@ typedef struct {
     qwen4_moe_half_pass *half_pass;
 } qwen4_stream_weights;
 static qwen4_stream_weights *g_qwen4_stream_weights;
+
+/* DS4_QWEN4_MOE_HALF_OPERAND=1 turns the resident half-operand pass on for
+ * A/B; the streaming path always supplies its own instance. */
+static qwen4_moe_half_pass *qwen4_moe_active_half_pass(void) {
+    if (g_qwen4_stream_weights && g_qwen4_stream_weights->half_pass)
+        return g_qwen4_stream_weights->half_pass;
+    if (g_qwen4_resident_half_on < 0) {
+        const char *e = getenv("DS4_QWEN4_MOE_HALF_OPERAND");
+        g_qwen4_resident_half_on = e && e[0] && strcmp(e, "0") != 0;
+    }
+    return g_qwen4_resident_half_on ? &g_qwen4_resident_half_pass : NULL;
+}
+
+static void qwen4_moe_clear_half_pass_mid(void) {
+    if (g_qwen4_stream_weights && g_qwen4_stream_weights->half_pass)
+        g_qwen4_stream_weights->half_pass->mid = NULL;
+    g_qwen4_resident_half_pass.mid = NULL;
+}
 static bool qwen4_moe_mm_legacy_ssd(uint32_t n_tokens, uint32_t type);
 
 static bool qwen4_bind_experts(qwen4_bind *b, const void *map, uint64_t size,
@@ -51387,6 +51627,278 @@ static uint32_t qwen4_moe_mv_groups(uint32_t type) {
     return (uint32_t)ds4_gpu_env_u64(name, ds4_gpu_env_u64("DS4_QWEN4_MOE_MV_NSG", default_nsg, 1u, 16u), 1u, 16u);
 }
 
+/* ---- Decode dispatch replay (MTLIndirectCommandBuffer) -------------------
+ * A T=1 step issues the same ~800 dispatches on every token: identical
+ * pipelines, argument blocks and buffer bindings.  The first decode step
+ * records that sequence into an indirect command buffer and later steps
+ * replay it; commands whose bindings do move (attention, KV windows) simply
+ * fail the comparison and are encoded the ordinary way, punched out of the
+ * replayed run.  Correctness only ever depends on the comparison, so a
+ * changed graph degrades to plain encoding instead of going wrong.
+ *
+ * Ordering: the run is executed when another encoder is opened or the batch
+ * closes, which keeps the replayed commands ahead of whatever the host
+ * encodes next.  DS4_QWEN4_ICB=0 turns this off. */
+#define QWEN4_ICB_MAX_COMMANDS 4096u
+#define QWEN4_ICB_ARGS_STRIDE  256u
+#define QWEN4_ICB_MAX_BINDS    16u
+#define QWEN4_ICB_MAX_RESIDENT 1024u
+
+typedef struct {
+    id<MTLComputePipelineState> pso;
+    uint32_t args_len;
+    uint32_t grid[3];
+    uint32_t tg[3];
+    NSUInteger tg_mem;
+    uint32_t n_binds;
+    __unsafe_unretained id<MTLBuffer> buf[QWEN4_ICB_MAX_BINDS];
+    NSUInteger off[QWEN4_ICB_MAX_BINDS];
+} qwen4_icb_slot;
+
+static id<MTLIndirectCommandBuffer> g_qwen4_icb;
+static id<MTLBuffer> g_qwen4_icb_args;
+static qwen4_icb_slot *g_qwen4_icb_slots;
+static uint32_t g_qwen4_icb_recorded;
+static uint32_t g_qwen4_icb_cursor;
+static uint32_t g_qwen4_icb_run;
+static int g_qwen4_icb_state;            /* 0 off, 1 recording, 2 replaying */
+static int g_qwen4_icb_enabled = -1;
+static __unsafe_unretained id<MTLResource> g_qwen4_icb_resident[QWEN4_ICB_MAX_RESIDENT];
+static uint32_t g_qwen4_icb_n_resident;
+
+static int qwen4_icb_enabled(void) {
+    if (g_qwen4_icb_enabled < 0) {
+        const char *e = getenv("DS4_QWEN4_ICB");
+        /* Opt-in only: on this driver an indirect compute command reads
+         * its input buffers as zero (see .workbuddy notes), so the
+         * replay stays an experiment instead of a default. */
+        g_qwen4_icb_enabled = e && e[0] && strcmp(e, "0") != 0;
+        g_qwen4_icb_one_per_run = getenv("DS4_QWEN4_ICB_ONE") != NULL;
+        g_qwen4_icb_only = getenv("DS4_QWEN4_ICB_ONLY");
+        g_qwen4_icb_also = getenv("DS4_QWEN4_ICB_ALSO") != NULL;
+        g_qwen4_icb_debug = getenv("DS4_QWEN4_ICB_DEBUG") != NULL;
+    }
+    return g_qwen4_icb_enabled;
+}
+
+static int qwen4_icb_create(void) {
+    if (g_qwen4_icb) return 1;
+    if (!g_device) return 0;
+    MTLIndirectCommandBufferDescriptor *d = [MTLIndirectCommandBufferDescriptor new];
+    d.commandTypes = MTLIndirectCommandTypeConcurrentDispatch;
+    d.inheritPipelineState = NO;
+    d.inheritBuffers = NO;
+    d.maxKernelBufferBindCount = QWEN4_ICB_MAX_BINDS;
+    g_qwen4_icb = [g_device newIndirectCommandBufferWithDescriptor:d
+                                                   maxCommandCount:QWEN4_ICB_MAX_COMMANDS
+                                                           options:MTLResourceStorageModeShared];
+    g_qwen4_icb_args = [g_device newBufferWithLength:(NSUInteger)QWEN4_ICB_MAX_COMMANDS * QWEN4_ICB_ARGS_STRIDE
+                                             options:MTLResourceStorageModeShared];
+    g_qwen4_icb_slots = calloc(QWEN4_ICB_MAX_COMMANDS, sizeof(qwen4_icb_slot));
+    if (g_qwen4_icb_debug)
+        fprintf(stderr, "ds4: icb created icb=%p args=%p maxbind=%u\n",
+                (void *)(__bridge void *)g_qwen4_icb, (void *)(__bridge void *)g_qwen4_icb_args, QWEN4_ICB_MAX_BINDS);
+    if (!g_qwen4_icb || !g_qwen4_icb_args || !g_qwen4_icb_slots) {
+        fprintf(stderr, "ds4: indirect command buffer unavailable; decode replay disabled\n");
+        g_qwen4_icb_enabled = 0;
+        g_qwen4_icb = nil;
+        return 0;
+    }
+    return 1;
+}
+
+static void qwen4_icb_note_resident(__unsafe_unretained id<MTLResource> buf) {
+    for (uint32_t i = 0; i < g_qwen4_icb_n_resident; i++)
+        if (g_qwen4_icb_resident[i] == buf) return;
+    if (g_qwen4_icb_n_resident < QWEN4_ICB_MAX_RESIDENT)
+        g_qwen4_icb_resident[g_qwen4_icb_n_resident++] = buf;
+}
+
+static void qwen4_icb_pending_flush(void) {
+    if (!g_qwen4_icb || g_qwen4_icb_run >= g_qwen4_icb_cursor) return;
+    const uint32_t first = g_qwen4_icb_run;
+    const uint32_t count = g_qwen4_icb_cursor - first;
+    g_qwen4_icb_run = g_qwen4_icb_cursor;
+    if (!g_batch_cb) return;
+    /* Indirect commands are concurrent by nature and their barriers only order
+     * them against each other, so the run gets a pass of its own: the pass
+     * boundary is what keeps it between the host-encoded neighbours. */
+    if (g_batch_enc) {
+        [g_batch_enc endEncoding];
+        g_batch_enc = nil;
+    }
+    g_qwen4_icb_draining = 1;
+    /* Indirect commands carry the concurrent dispatch type, so the executing
+     * encoder is opened the same way; the pass holds nothing else. */
+    id<MTLComputeCommandEncoder> enc = getenv("DS4_QWEN4_ICB_SERIAL")
+        ? [g_batch_cb computeCommandEncoder]
+        : [g_batch_cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
+    g_qwen4_icb_draining = 0;
+    if (!enc) return;
+    if (getenv("DS4_QWEN4_ICB_NORES")) goto run;
+    [enc useResource:g_qwen4_icb usage:MTLResourceUsageRead];
+    [enc useResource:g_qwen4_icb_args usage:MTLResourceUsageRead];
+    if (g_qwen4_icb_n_resident)
+        [enc useResources:g_qwen4_icb_resident
+                    count:g_qwen4_icb_n_resident
+                    usage:MTLResourceUsageRead | MTLResourceUsageWrite];
+run:
+    if (g_qwen4_icb_debug && g_qwen4_icb_dbg_n < 8) {
+        g_qwen4_icb_dbg_n++;
+        fprintf(stderr, "ds4: icb exec [%u,%u) enc=%p\n", first, first + count, (__bridge void *)enc);
+    }
+    [enc executeCommandsInBuffer:g_qwen4_icb withRange:NSMakeRange(first, count)];
+    [enc endEncoding];
+    g_batch_enc = nil;
+}
+
+/* enable: this forward is a single-token decode step */
+void ds4_gpu_qwen4_replay_set(int enable) {
+    if (!enable || !qwen4_icb_enabled() || !qwen4_icb_create()) {
+        if (g_qwen4_icb_state) qwen4_icb_pending_flush();
+        g_qwen4_icb_state = 0;
+        return;
+    }
+    g_qwen4_icb_state = g_qwen4_icb_recorded ? 2 : 1;
+    g_qwen4_icb_cursor = 0;
+    g_qwen4_icb_run = 0;
+    g_qwen4_icb_capped = 0;
+}
+
+/* 1: the dispatch is in the replayed run and needs no encoding */
+static int qwen4_icb_try(int kernel, id<MTLComputePipelineState> pso, const void *args, size_t args_len,
+                         const qwen4_bind *binds, int n_binds,
+                         MTLSize grid, MTLSize tg, NSUInteger tg_mem) {
+    if (!g_qwen4_icb_state || !g_qwen4_icb) return 0;
+    if (g_qwen4_icb_only && strcmp(g_qwen4_icb_only, qwen4_kernel_names[kernel]) != 0) return 0;
+    if (n_binds < 0 || (uint32_t)n_binds > QWEN4_ICB_MAX_BINDS || args_len > QWEN4_ICB_ARGS_STRIDE) {
+        g_qwen4_icb_capped = 1;
+        if (g_qwen4_icb_debug && g_qwen4_icb_reason_n < 8) {
+            g_qwen4_icb_reason_n++;
+            fprintf(stderr, "ds4: icb skip %s binds=%d (max %u) args=%zu (max %u)\n",
+                    qwen4_kernel_names[kernel], n_binds, QWEN4_ICB_MAX_BINDS, args_len,
+                    QWEN4_ICB_ARGS_STRIDE);
+        }
+        return 0;
+    }
+    char *arg_base = (char *)[g_qwen4_icb_args contents];
+    if (!arg_base) { g_qwen4_icb_capped = 1; return 0; }
+    if (g_qwen4_icb_state == 1) {
+        if (g_qwen4_icb_capped) return 0;
+        /* Diagnostic bisect: record only the first N commands of the step. */
+        const char *cap_env = getenv("DS4_QWEN4_ICB_CAP");
+        if (cap_env && g_qwen4_icb_recorded >= (uint32_t)strtoul(cap_env, NULL, 10)) {
+            g_qwen4_icb_capped = 1;
+            return 0;
+        }
+        if (g_qwen4_icb_recorded >= QWEN4_ICB_MAX_COMMANDS) { g_qwen4_icb_capped = 1; return 0; }
+        const uint32_t i = g_qwen4_icb_recorded;
+        memcpy(arg_base + (size_t)i * QWEN4_ICB_ARGS_STRIDE, args, args_len);
+        id<MTLIndirectComputeCommand> cmd = [g_qwen4_icb indirectComputeCommandAtIndex:i];
+        if (!cmd) { g_qwen4_icb_capped = 1; return 0; }
+        /* Commands in one buffer run concurrently by default, and a command
+         * without a barrier may be reordered past (or dropped behind) its
+         * predecessor: a chain of dependent kernels then reads stale data.
+         * The normal encoder is serial, so the replay has to ask for the same
+         * ordering explicitly on every command but the first. */
+        if (i > 0u && !getenv("DS4_QWEN4_ICB_NOBARRIER")) [cmd setBarrier];
+        [cmd setComputePipelineState:pso];
+        [cmd setKernelBuffer:g_qwen4_icb_args offset:(NSUInteger)i * QWEN4_ICB_ARGS_STRIDE atIndex:0];
+        for (int k = 0; k < n_binds; k++) {
+            [cmd setKernelBuffer:binds[k].buf offset:binds[k].off atIndex:(NSUInteger)(k + 1)];
+            qwen4_icb_note_resident(binds[k].buf);
+        }
+        if (tg_mem) [cmd setThreadgroupMemoryLength:tg_mem atIndex:0];
+        [cmd concurrentDispatchThreadgroups:grid threadsPerThreadgroup:tg];
+        if (g_qwen4_icb_debug && g_qwen4_icb_dbg_n < 4) {
+            g_qwen4_icb_dbg_n++;
+            fprintf(stderr, "ds4: icb rec %u %s cmd=%p binds=%d grid=%ux%ux%u\n", i,
+                    qwen4_kernel_names[kernel], (__bridge void *)cmd, n_binds,
+                    (unsigned)grid.width, (unsigned)grid.height, (unsigned)grid.depth);
+        }
+        if (g_qwen4_icb_debug && i < 8u) {
+            fprintf(stderr, "ds4: icb REC[%u] %s pso=%p grid=%ux%ux%u tg=%ux%ux%u binds=%d argslen=%zu\n",
+                    i, qwen4_kernel_names[kernel], (__bridge void *)pso,
+                    (unsigned)grid.width, (unsigned)grid.height, (unsigned)grid.depth,
+                    (unsigned)tg.width, (unsigned)tg.height, (unsigned)tg.depth,
+                    n_binds, args_len);
+            for (int k = 0; k < n_binds && k < 4; k++)
+                fprintf(stderr, "    bind%d buf=%p off=%lu\n", k + 1,
+                        (__bridge void *)binds[k].buf, (unsigned long)binds[k].off);
+        }
+        qwen4_icb_slot *s = &g_qwen4_icb_slots[i];
+        s->pso = pso;
+        s->args_len = (uint32_t)args_len;
+        s->grid[0] = (uint32_t)grid.width; s->grid[1] = (uint32_t)grid.height; s->grid[2] = (uint32_t)grid.depth;
+        s->tg[0] = (uint32_t)tg.width; s->tg[1] = (uint32_t)tg.height; s->tg[2] = (uint32_t)tg.depth;
+        s->tg_mem = tg_mem;
+        s->n_binds = (uint32_t)n_binds;
+        for (int k = 0; k < n_binds; k++) { s->buf[k] = binds[k].buf; s->off[k] = binds[k].off; }
+        g_qwen4_icb_recorded = i + 1u;
+        g_qwen4_icb_cursor = i + 1u;
+        g_qwen4_icb_run = i + 1u;
+        return 0;   /* the recording step still encodes normally */
+    }
+    const uint32_t i = g_qwen4_icb_cursor;
+    int match = i < g_qwen4_icb_recorded;
+    if (match) {
+        const qwen4_icb_slot *s = &g_qwen4_icb_slots[i];
+        match = s->pso == pso && s->args_len == (uint32_t)args_len && s->n_binds == (uint32_t)n_binds &&
+                s->tg_mem == tg_mem &&
+                s->grid[0] == (uint32_t)grid.width && s->grid[1] == (uint32_t)grid.height &&
+                s->grid[2] == (uint32_t)grid.depth &&
+                s->tg[0] == (uint32_t)tg.width && s->tg[1] == (uint32_t)tg.height && s->tg[2] == (uint32_t)tg.depth &&
+                memcmp(arg_base + (size_t)i * QWEN4_ICB_ARGS_STRIDE, args, args_len) == 0;
+        for (int k = 0; match && k < n_binds; k++)
+            match = s->buf[k] == binds[k].buf && s->off[k] == binds[k].off;
+    }
+    if (!match) {
+        qwen4_icb_pending_flush();
+        g_qwen4_icb_cursor = i + 1u;
+        g_qwen4_icb_run = i + 1u;
+        return 0;
+    }
+    if (g_qwen4_icb_debug && i < 2u) {
+        static int shown;
+        if (shown < 2) {
+            shown++;
+            fprintf(stderr, "ds4: icb HIT[%u] %s pso=%p grid=%ux%ux%u tg=%ux%ux%u binds=%d argslen=%zu\n",
+                    i, qwen4_kernel_names[kernel], (__bridge void *)pso,
+                    (unsigned)grid.width, (unsigned)grid.height, (unsigned)grid.depth,
+                    (unsigned)tg.width, (unsigned)tg.height, (unsigned)tg.depth,
+                    n_binds, args_len);
+            for (int k = 0; k < n_binds && k < 4; k++)
+                fprintf(stderr, "    bind%d buf=%p off=%lu\n", k + 1,
+                        (__bridge void *)binds[k].buf, (unsigned long)binds[k].off);
+        }
+    }
+    g_qwen4_icb_cursor = i + 1u;
+    if (g_qwen4_icb_one_per_run) qwen4_icb_pending_flush();
+    return g_qwen4_icb_also ? 0 : 1;
+}
+
+/* Replay needs pipelines compiled with indirect support; the plain path keeps
+ * the historical function-based compilation. */
+static id<MTLComputePipelineState> qwen4_new_pipeline(id<MTLFunction> fn, NSError **error) {
+    if (!qwen4_icb_enabled()) return [g_device newComputePipelineStateWithFunction:fn error:error];
+    MTLComputePipelineDescriptor *d = [MTLComputePipelineDescriptor new];
+    d.computeFunction = fn;
+    d.supportIndirectCommandBuffers = YES;
+    return [g_device newComputePipelineStateWithDescriptor:d options:MTLPipelineOptionNone
+                                                reflection:nil error:error];
+}
+
+static id<MTLComputePipelineState> qwen4_new_pipeline_named(const char *name) {
+    id<MTLFunction> fn = [g_library newFunctionWithName:[NSString stringWithUTF8String:name]];
+    if (!fn) return nil;
+    NSError *error = nil;
+    id<MTLComputePipelineState> pso = qwen4_new_pipeline(fn, &error);
+    if (!pso)
+        fprintf(stderr, "ds4: Qwen3.8 kernel '%s' pipeline failed: %s\n",
+                name, [[error localizedDescription] UTF8String]);
+    return pso;
+}
+
 /* resident: buffers the kernel reaches through GPU addresses rather than
  * bindings (the decode batch's per-session caches); they are made resident
  * for this dispatch. */
@@ -51424,7 +51936,7 @@ static int qwen4_dispatch_resident(int kernel, const void *args, size_t args_len
                 id<MTLFunction> fn = [g_library newFunctionWithName:
                     [NSString stringWithUTF8String:qwen4_kernel_names[kernel]]
                     constantValues:constants error:&error];
-                if (fn) pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+                if (fn) pipeline = qwen4_new_pipeline(fn, &error);
                 if (!pipeline) {
                     fprintf(stderr, "ds4: Qwen MoE decode pipeline failed: %s\n", [[error localizedDescription] UTF8String]);
                     return 0;
@@ -51457,7 +51969,7 @@ static int qwen4_dispatch_resident(int kernel, const void *args, size_t args_len
                 id<MTLFunction> fn = [g_library newFunctionWithName:
                     [NSString stringWithUTF8String:qwen4_kernel_names[kernel]]
                     constantValues:constants error:&error];
-                if (fn) pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+                if (fn) pipeline = qwen4_new_pipeline(fn, &error);
                 if (!pipeline) {
                     fprintf(stderr, "ds4: Qwen MoE pipeline failed: %s\n",
                             [[error localizedDescription] UTF8String]);
@@ -51467,7 +51979,9 @@ static int qwen4_dispatch_resident(int kernel, const void *args, size_t args_len
             }
         } else {
             if (!g_qwen4_pipelines[kernel]) {
-                g_qwen4_pipelines[kernel] = ds4_gpu_get_pipeline(qwen4_kernel_names[kernel]);
+                g_qwen4_pipelines[kernel] = qwen4_icb_enabled()
+                    ? qwen4_new_pipeline_named(qwen4_kernel_names[kernel])
+                    : ds4_gpu_get_pipeline(qwen4_kernel_names[kernel]);
                 if (!g_qwen4_pipelines[kernel]) {
                     static int source_skew_note;
                     if (!source_skew_note) {
@@ -51485,6 +51999,11 @@ static int qwen4_dispatch_resident(int kernel, const void *args, size_t args_len
             }
             pipeline = g_qwen4_pipelines[kernel];
         }
+        /* Everything this path dispatches is a pure function of its bindings,
+         * so a repeated decode command can replay instead of re-encoding. */
+        if (!addresses && !n_resident &&
+            qwen4_icb_try(kernel, pipeline, args, args_len, binds, n_binds, grid, tg, tg_mem))
+            return 1;
         int owned = 0;
         id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
         if (!cb) return 0;
@@ -51593,8 +52112,13 @@ int ds4_gpu_qwen4_hc_combine_norm_tensor(
     if (!qwen4_bind_tensor(&b[5], next_R, dim * sizeof(float), "combine norm next R") ||
         !qwen4_bind_tensor(&b[6], blk, n_embd * sizeof(float), "combine norm block") ||
         !qwen4_bind_tensor(&b[7], old_inj, n_hc * DS4_QWEN4_HC_CHUNKS * n_hc * sizeof(float), "combine norm old inject")) return 0;
+    /* Single-wave T=1/T=2 steps: the kernel's cost is its own serial walk
+     * over E, so more threads shorten it. Prefill keeps 128 (grid.y already
+     * spans the tokens) and the reduction array is sized for 32 simdgroups. */
+    const uint32_t combine_threads = n_tokens > 8u ? 128u :
+        (uint32_t)ds4_gpu_env_u64("DS4_QWEN4_HC_COMBINE_THREADS", 512u, 32u, 1024u);
     return qwen4_dispatch(QWEN4_K_HC_COMBINE_NORM, &args, sizeof(args), b, 8,
-        MTLSizeMake(n_hc * DS4_QWEN4_HC_CHUNKS, 1, 1), MTLSizeMake(128, 1, 1), 0);
+        MTLSizeMake(n_hc * DS4_QWEN4_HC_CHUNKS, 1, 1), MTLSizeMake(combine_threads, 1, 1), 0);
 }
 
 int ds4_gpu_qwen4_hc_norm_tensor(
@@ -51643,8 +52167,14 @@ int ds4_gpu_qwen4_hc_norm_tensor(
     const int kernel = reuse
         ? qwen4_hc_kernel(weight_type, QWEN4_K_HC_NORM_REUSE_F16, QWEN4_K_HC_NORM_REUSE_F32, QWEN4_K_HC_NORM_REUSE_Q8)
         : qwen4_hc_kernel(weight_type, QWEN4_K_HC_NORM_F16, QWEN4_K_HC_NORM_F32, QWEN4_K_HC_NORM_Q8);
+    /* The reuse variant sizes its inject partials for four simdgroups.
+     * Prefill keeps 128 threads: measured 128 > 256 > 512 > 1024 on M1 Ultra
+     * (513 / 508 / 496 / 450 t/s at 2048 ctx), so the wide walk helps only
+     * the single-wave decode step. */
+    const uint32_t norm_threads = (reuse || n_tokens > 8u) ? 128u :
+        (uint32_t)ds4_gpu_env_u64("DS4_QWEN4_HC_NORM_THREADS", 512u, 32u, 1024u);
     return qwen4_dispatch(kernel, &args, sizeof(args), b, 5,
-                          MTLSizeMake(reuse ? n_hc : n_hc * DS4_QWEN4_HC_CHUNKS, n_tokens, 1), MTLSizeMake(128, 1, 1), 0);
+                          MTLSizeMake(reuse ? n_hc : n_hc * DS4_QWEN4_HC_CHUNKS, n_tokens, 1), MTLSizeMake(norm_threads, 1, 1), 0);
 }
 
 int ds4_gpu_qwen4_hc_gate_mix_tensor(
@@ -53126,7 +53656,7 @@ int ds4_gpu_qwen4_moe_mm_mid_tensor(
         const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset,
         uint32_t weight_type, uint32_t n_expert, uint32_t n_tokens, uint32_t n_slots, uint32_t n_out,
         uint32_t in_dim, uint32_t ff_dim, uint32_t list_cap) {
-    qwen4_moe_half_pass *hp = g_qwen4_stream_weights ? g_qwen4_stream_weights->half_pass : NULL;
+    qwen4_moe_half_pass *hp = qwen4_moe_active_half_pass();
     if (hp) hp->mid = NULL;
     const uint32_t row_bytes = qwen4_expert_row_bytes(weight_type, in_dim);
     const uint64_t expert_bytes = (uint64_t)row_bytes * ff_dim;
@@ -53155,14 +53685,17 @@ int ds4_gpu_qwen4_moe_mm_mid_tensor(
     const uint32_t dispatch_experts = qwen4_moe_mm_dispatch_experts(&args);
     if (dispatch_experts == UINT32_MAX) return 0;
     if (!dispatch_experts) {
-        if (g_qwen4_stream_weights && g_qwen4_stream_weights->half_pass)
-            g_qwen4_stream_weights->half_pass->mid = NULL;
+        qwen4_moe_clear_half_pass_mid();
         /* No mid rows were produced or consumed. Do not let an unrelated
          * earlier NAX half-copy association survive this empty pass. */
         g_qwen4_nax_half_mid_for = NULL;
         g_qwen4_nax_half_mid_count = 0;
         return 1;
     }
+    ds4_acc_note("moe_mid", 4.0 * (double)n_tokens * (double)n_out * (double)ff_dim * (double)in_dim);
+    if (ds4_stat_enabled())
+        fprintf(stderr, "moeshape mid tok=%u slots=%u out=%u in=%u ff=%u expr=%u type=%u nt=%u tiles=%u\n",
+                n_tokens, n_slots, n_out, in_dim, ff_dim, n_expert, weight_type, nt, tiles);
     const uint32_t nax = qwen4_moe_mm_nax(weight_type);
     const bool nax_fx = qwen4_moe_mm_nax_fx(weight_type);
     const bool nax_comp = qwen4_moe_mm_nax_comp(weight_type);
@@ -53247,7 +53780,7 @@ int ds4_gpu_qwen4_moe_mm_down_tensor(
         const void *model_map, uint64_t model_size, uint64_t down_offset,
         uint32_t weight_type, uint32_t n_expert, uint32_t n_tokens, uint32_t n_slots, uint32_t n_out,
         uint32_t ff_dim, uint32_t out_dim, uint32_t list_cap) {
-    qwen4_moe_half_pass *hp = g_qwen4_stream_weights ? g_qwen4_stream_weights->half_pass : NULL;
+    qwen4_moe_half_pass *hp = qwen4_moe_active_half_pass();
     const qwen4_moe_half_pass producer = hp ? *hp : (qwen4_moe_half_pass){0};
     if (hp) hp->mid = NULL; /* consume even if validation or dispatch fails */
     const uint32_t weight_dim = weight_type == 10u ? (ff_dim + 255u) / 256u * 256u : ff_dim;
@@ -53277,14 +53810,17 @@ int ds4_gpu_qwen4_moe_mm_down_tensor(
     const uint32_t dispatch_experts = qwen4_moe_mm_dispatch_experts(&args);
     if (dispatch_experts == UINT32_MAX) return 0;
     if (!dispatch_experts) {
-        if (g_qwen4_stream_weights && g_qwen4_stream_weights->half_pass)
-            g_qwen4_stream_weights->half_pass->mid = NULL;
+        qwen4_moe_clear_half_pass_mid();
         /* No mid rows were produced or consumed. Do not let an unrelated
          * earlier NAX half-copy association survive this empty pass. */
         g_qwen4_nax_half_mid_for = NULL;
         g_qwen4_nax_half_mid_count = 0;
         return 1;
     }
+    ds4_acc_note("moe_down", 2.0 * (double)n_tokens * (double)n_out * (double)out_dim * (double)ff_dim);
+    if (ds4_stat_enabled())
+        fprintf(stderr, "moeshape down tok=%u slots=%u out=%u ff=%u od=%u expr=%u type=%u nt=%u tiles=%u\n",
+                n_tokens, n_slots, n_out, ff_dim, out_dim, n_expert, weight_type, nt, tiles);
     const uint32_t nax = qwen4_moe_mm_nax(weight_type);
     const bool nax_fx = qwen4_moe_mm_nax_fx(weight_type);
     bool nax_comp = qwen4_moe_mm_nax_comp(weight_type);

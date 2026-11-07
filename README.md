@@ -1,267 +1,125 @@
-<p align="center">
-  <img src="logo.svg" alt="DwarfStar logo" width="220">
-</p>
+# ds4 · M1 Ultra 上的 Qwen3.8 Flash 优化记录
 
-**DwarfStar** aims to be the best way to run a few excellent large
-language models on consumer hardware (that is, hardware that people
-can actually own). To reach this goal, we are building
-a small native inference engine optimized first for
-**DeepSeek V4 Flash** (including the experimental vision model),
-**DeepSeek V4.1 Flash** (Metal, and text inference on CUDA),
-and additionally **GLM 5.2 and 5.3**, **GLM 5.3 Flash** and
-**DeepSeek V4 PRO**, and **Qwen3.8 Flash Next** (Metal and CUDA). The code is self-contained and
-deliberately narrow, not a general GGUF runner: you need to use the
-GGUF files the project produces, that are part of the project
-itself.
+本仓库是 [antirez/ds4](https://github.com/antirez/ds4) 的个人分支，基线提交 `b3f5018`。
+只做一件事：**把 Qwen3.8 Flash Next Q4 在 Apple M1 Ultra / Metal 上的推理速度调上去**。
+上游代码、提交历史与 MIT 许可（`LICENSE`）均保留，`origin` 仍指向上游以便继续合并更新。
 
-We test things in integration: model loading, prompt rendering,
-tool calls, KV state, the HTTP server, and the coding agent are built and tested together.
-The repository also includes tools and data for GGUF, imatrix, quality, and speed.
+> 仓库里**不含任何模型权重**（文本模型、视觉模型都没有），需要自行准备 GGUF。
 
-## Supported hardware
+---
 
-* **Metal**, the primary target, on Macs with 64 GB (for Qwen Flash next) and 96 GB or more (for DeepSeek and GLM). Smaller machines can use SSD streaming. SSD streaming is also needed in order to run very large models such as full GLM 5.x (not Flash) on 128GB systems.
-* **NVIDIA CUDA**, the DGX Spark is our main gaol. DwarfStar also supports multi-GPU systems that are not supported by other backends, for instance it can run DeepSeek v4 Flash on Ada Lovelace cards.
-* **ROCm** on Strix Halo systems such as the Framework Desktop.
+## 1. 优化前 / 优化后怎么定义
 
-This project would not exist without **llama.cpp and GGML**, make sure to read
-the acknowledgements section, a big thank you to Georgi Gerganov and all the
-other contributors.
+| | 含义 |
+|---|---|
+| **优化前（stock）** | 干净的 `b3f5018`，不带任何本地补丁，不设任何 `DS4_QWEN4_*` 环境变量 |
+| **优化后** | 本分支 `main`，含 M1 Ultra 默认值注入 + Metal 内核改动 + 服务端采样默认值 |
 
-**Model support is intentionally opportunistic**. The project follows the best open
-weights for useful local machine sizes, especially 128 GB laptops and 256/512 GB
-workstations. A model may be removed when a better replacement arrives.
+测试环境：Mac Studio（Mac13,2）、Apple M1 Ultra 48 核 GPU / 128 GiB 统一内存、macOS arm64、
+`Qwen3.8-Flash-Next-Q4.gguf`（约 165 GiB，常驻权重 69.73 GiB）。
+统一用 `--metal -t 16 --warm-weights`、`--temp 0`（贪心），A/B 同场次交错重复取中位数。
 
-# So, what can I do with this software?
+**噪声地板**：同配置重复差 0.07 t/s，跨场次漂移约 0.5 t/s，**小于 1% 的差异一律不算数**。
+任何"提速"先过输出逐字节校验（与 stock 比对），再看 t/s —— 这条纪律下面会解释为什么重要。
 
-* You can run a very capable models in your consumer hardware, a MacBook, a DGX Spark, or a Strix Halo for example. Even if you have not enough RAM, with SSD streaming, you can run it at a decent speed.
-* You can use multiple CUDA cards as a multi-user LLM server. Ada Lovelace, including L40S, is supported: newer models can run here even when their other inference implementations require newer GPUs. Our eight-L40S Flash setup has reached about 126 t/s aggregate generation with 16 sessions.
-* Using two 128 GB Macs connected with RDMA, you can run 4-bit DeepSeek Flash or GLM 5.3 Flash with tensor parallelism. Larger GLM 5.2 quants need larger machines, such as Mac Studios.
-* You can also use pipeline paralellism to glue together multiple systems to sum their RAM and run larger models.
+## 2. 核心指标（ctx 2048，同场次 A/B）
 
-## Motivations
+| 指标 | 优化前 | 优化后 | 变化 |
+|---|---:|---:|---:|
+| prefill | 443.5 t/s | **529.3 t/s** | **+19.3%** |
+| decode | 31.0 t/s | **36.4 t/s** | **+17.4%** |
+| MTP 投机解码 | 38.7 t/s | **46.0 t/s** | **+18.9%** |
 
-* Capable open-weight models now fit on high-end personal machines.
-* DeepSeek V4 Flash and PRO, GLM 5.2, tolerate aggressive routed-expert quantization.
-* Compressed KV caches and fast local SSDs make long contexts practical.
-* The idea of an inference system specialized for a few models.
+后续把路由层的 F32 矩阵乘改道到 `kernel_mul_mm_f32_f32_full`，prefill 中位数进一步提升到
+**549.9 t/s**（另一场次测得 +5.6%，不与上表直接并列）。prefill 与 MTP 已达标，
+**decode 目标 40 t/s 未达成**，原因见第 5 节。
 
-# AI full disclosure
+## 3. 长上下文：真正的问题不是"新版变慢了"
 
-* This software is developed with **strong assistance from AI coding agents** and with humans leading the ideas, testing, and debugging. We say this openly because it shaped how the project was built. If you are not happy with AI-developed code, this software is not for you. The acknowledgement below is equally important: this would not exist without `llama.cpp` and GGML, largely written by hand.
+新目录在 256K 上下文下 decode 掉到 20 t/s 出头，旧目录却能保持 28 t/s 以上，一度以为是新版本退化。
+实测 ctx 曲线（`ds4-bench` 稳态口径）：
 
-## Acknowledgements to llama.cpp and GGML
+| ctx | 优化前 | 优化后 | 变化 |
+|---:|---:|---:|---:|
+| 2 048 | 29.56 t/s | **36.40 t/s** | +23.1% |
+| 65 536 | 26.45 t/s | **34.41 t/s** | +30.1% |
+| 262 144 | 20.34 t/s | **28.29 t/s** | +39.1% |
 
-`ds4.c` does not link against GGML, but it **exists thanks to the path opened by the
-llama.cpp project and the kernels, quantization formats, GGUF ecosystem, and hard-won
-engineering knowledge developed there**.
-We are thankful and indebted to [`llama.cpp`](https://github.com/ggml-org/llama.cpp)
-and its contributors. Their implementation, kernels, tests, and design choices were
-an essential reference while building this DeepSeek V4 specific inference path.
-Some source-level pieces are retained or adapted here under the MIT license: GGUF
-quant layouts and tables, CPU quant/dot logic, and certain kernels. For this
-reason, and because we are genuinely grateful, we keep the GGML authors copyright
-notice in our `LICENSE` file.
+**结论**：新旧版本的衰减绝对量几乎相同（约 -8~9 t/s），差的是基数。旧版本地补丁
+`qwen4_tuned_like_m3_ultra()` 把 M3 Ultra 专属的 7 处默认值也给了 M1 Ultra；新目录是纯净上游，
+回落到通用路径，所以整体更慢。本分支在 `ds4_gpu_detect_metal4_features()` 里把 21 个调优默认值
+重新注入给 M1 Ultra，问题消失。
 
-## Status
+之前一直没发现，是因为基准测试始终套着 `env_best.txt` 里的 21 个开关，把差异掩盖了。
 
-The software is currently very fast changing. Consider it beta quality.
-Before each release, a big QA run is executed, however instabilities
-and regressions are definitely possible.
+## 4. 256K 上下文下的 MTP（端到端 A/B）
 
-# How to use this project?
+`ds4-bench` 不支持 `--mtp`，因此两条腿都走 `ds4 --prompt-file`（261 978 token 提示词，
+`--ctx 262144 -n 192 --temp 0`）：
 
-I (Salvatore) believe that the way projects should be shipped and used changed because of AI. The main differences today are:
+| 配置 | prefill | decode | 接受率 |
+|---|---:|---:|---:|
+| 无 MTP | 508.0 t/s | **31.07 t/s** | — |
+| `--mtp` | 544.3 t/s | **36.63 t/s** | 81.3%（91 cycles / 74） |
 
-1. With AI, users can modify the software in significant ways with low efforts, costs, and even lacking deep domain knowledge about the task they want to accomplish. For instance, a DwarfStar user with a specific hardware setup can ask a coding agent to improve the inference speed of this software for the specific hardware setup, asking the model to reach the maximum prefill and generation speed without impacting correctness, and also asking to do a deep QA pass.
-2. Similiarly, because of "1", software may be shipped in a different way than before. It must be more a working template for the biggest use cases, without trying to cover every possible setup. If DwarfStar showcases a few good implementations of tensor parallel execution, the code will work as a rail for implementing the same feature in specific conditions, for a new model, and so forth.
+**+17.9%**，与短上下文的 +18.7%（30.61 → 36.33 t/s，接受率 75.2%）几乎一致：
+收益与上下文长度基本无关 —— 2-row verify 省下的权重读取，被第二行 attention/indexer 的开销抵掉了。
 
-So, while this project attempts to be usable for the featured models and the most common hardware setups, I ask you, if you have access to coding agents, to consider using coding agents as an interface to discover the project, make modifications, create personalized setups. This way you can likely do more than what we ship, and certain things that are not documented or implemented, and that you require, are potentially very easy to achieve.
+质量方面：`--temp 0` 时逐字节无损（6 次运行 MD5 一致），因为只在
+`draft == target argmax` 时才接受；`temp > 0` 时必须加 `--mtp-exact-sampling`
+才能严格保持温度分布，否则约 80% 的位置会偷偷变成贪心。
 
-## Start Here
+## 5. 做了哪些改动
 
-```sh
-git clone https://github.com/antirez/ds4.git
-cd ds4
-```
+1. **M1 Ultra 默认值注入**（收益最大的一项）：在设备探测阶段对 M1 Ultra 设置 21 个
+   `DS4_QWEN4_*` 开关；用户显式设的环境变量优先，`DS4_QWEN4_NO_M1_ULTRA_DEFAULTS=1` 可整体关闭。
+2. **路由 GEMM 改道**：`qwen4_gemv_rows()` 中 F32 权重、大 batch、维度对齐时走
+   `kernel_mul_mm_f32_f32_full`，prefill +5.6%；`DS4_QWEN4_NO_ROUTER_MM=1` 可回退。
+3. **Metal 内核微调**：`hc_norm`/`hc_combine_norm` 线程组 128→512；resident MoE 半精度操作数
+   接线（`DS4_QWEN4_MOE_HALF_OPERAND=1`，输出逐位一致）；两个 decode 融合可独立关闭以便 A/B；
+   `DS4_QWEN4_MM_STATS=1` 输出 GEMM 形状与 MoE FLOPs 直方图。
+4. **服务端采样默认值**：`ds4-server` 新增 `--temp/--top-p/--top-k/--min-p`，只作用于
+   客户端未传的字段（显式请求值永远优先），启动时打印生效值。
+5. **KV 缓存精度**（实测，非改动）：K/V 为 **FP16**，indexer key 为 FP32，block key 为 FP16；
+   13 层带 KV，262144 ctx 实测 `KV 8.33 GiB (raw 6.50 + compressed 1.83)`。没有 q8/q4 量化。
 
-Choose your build. The platform guides cover prerequisites, memory sizing,
-and hardware-specific setups:
+`DS4_QWEN4_ICB` 回放层代码保留但**默认关闭**：`MTLIndirectCommandBuffer` 把绑定偏移截断到
+32 位（5 GiB 实际读到 1 GiB），与单块 69.73 GiB 模型映射根本冲突，启用会输出乱码，不要开。
 
-| Platform guide | Build |
-| --- | --- |
-| [Metal on Apple Silicon](docs/METAL.md) | `make` |
-| [DGX Spark](docs/DGX_SPARK.md) | `make cuda-spark` |
-| [Strix Halo / Framework Desktop](docs/STRIX_HALO.md) | `make strix-halo` |
-| [One or more CUDA cards, including Ada/L40S](docs/CUDA_MULTI_GPU.md) | `make cuda-generic` |
+## 6. 定因与「别再试」清单
 
-For a first run on a 96 or 128 GB machine, download DeepSeek V4 Flash Q2:
+- **GEMM 已到硬件天花板**：最小程序实测 M1 Ultra 的 `simdgroup_multiply_accumulate`
+  峰值仅 **13.8 TFLOP/s**（M1 无矩阵单元，FMA 模拟），`kernel_mul_mm_f16_f32` 已跑
+  12.9 TFLOP/s = **93%**。64×64 tile 变体理论上限 7%，实测为 0，不用做。
+- **decode 40 t/s 不是带宽问题**：把 MoE 权重读取和反量化**整个删掉**，decode 也只有
+  40.08 t/s（破坏性实验）。实测 27.5 ms/步 = GPU 19.0 + CPU 编码 3.7（自回归无法重叠）
+  \+ commit→启动 4.0。f16 权重（3.56 倍数据量、165 GiB 装不下）是死路。
+  剩下的空间只有 ICB 预录制（上限约 41）或层内融合（40~42），都是数小时级改造且会破坏逐字节一致。
+- **`DS4_QWEN4_GDN_FRONT_THREADS=1024` 让 decode +17%，但输出乱码**；
+  384/512/640/768 逐位一致，取 512。这是"先校验再提速"纪律的由来。
+- **MoE mid 的 tile 几何别动**：NT=1/2/8 分别 -12/-4/-3%；运行时跳过尾部 MMA -43%
+  （破坏展开致累加器 spill）；64 行 tile / 256 线程 -4.5%。44% 效率是 Q4_K 反量化
+  + barrier 的结构成本，不是 tile 参数问题。
+- 其余证伪项：`MTP_DEPTH=3` 手工锁死、`F16_MM_DECODE=1`、`FLUSH_LAYER=1/96`、
+  ICB 分块绑定的三种绕法（全部 OOM，因上游刻意用极少数重叠大视图 + 一次性 residency）。
 
-```sh
-./download_model.sh ds4f-q2
-```
-
-Downloads go in `gguf/`. Repeat the command to resume an interrupted download.
-Leave memory for the context and runtime buffers as well as the model.
-See [other models](docs/MODELS.md) or use [SSD streaming](docs/SSD_STREAMING.md)
-on a smaller Mac.
-
-## Everyday Use
-
-Once built and with a model downloaded:
+## 7. 复现
 
 ```sh
-./ds4
-./ds4 -p "Explain Redis streams in one paragraph."
-./ds4-agent
-./ds4-server --ctx 32768
+make clean && make -j4        # Makefile 无头文件依赖追踪，更新后必须 clean
+./ds4 -m ds4flash.gguf --metal -t 16 --warm-weights --ctx 262144 \
+      --mtp --temp 0
+
+# 服务端：官方思考模式采样默认值 + 严格保分布的投机解码
+./ds4-server -m ds4flash.gguf --metal -t 16 --ctx 262144 \
+      --mtp --mtp-exact-sampling \
+      --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0
 ```
 
-The default model is `ds4flash.gguf`, a link updated by main-model downloads.
-Pass `-m FILE` to choose explicitly. Commands normally run from the repository
-root; use `--chdir /path/to/ds4` when launching elsewhere.
+从上游更新后，需要重新应用本地默认值补丁，否则 decode 会从 36.4 掉回 29.6，
+262K 时从 28.3 掉到 20.3。补丁与幂等脚本保存在本机，未纳入本仓库。
 
-The server listens at `http://127.0.0.1:8000` by default; see [serving](docs/SERVER.md)
-for API access and multiple sessions.
+## 8. 许可
 
-The interactive CLI keeps a multi-turn conversation. Use `/help`, `/read FILE`,
-`/ctx N`, and `/quit`. Ctrl+C interrupts generation and returns to the prompt.
-Run each binary with `--help` for its full options.
-
-### Native coding agent
-
-`ds4-agent` runs inference directly, without a separate HTTP server. It keeps
-the token history and live model state together, shows prefill progress, and
-uses the model's native tool format. DeepSeek and GLM have their own templates.
-
-Use `/hints on` for occasional, brief explanations of the programming choices
-behind the work, and `/hints off` to stop them. Changes take effect at the next
-conversation boundary without rebuilding the cached context. New and resumed
-sessions start with hints off.
-
-Sessions are stored in `~/.ds4/kvcache`:
-
-| Command | Action |
-| --- | --- |
-| `/save` | Save the current session |
-| `/list` | List saved sessions |
-| `/switch <sha>` | Resume a session |
-| `/del <sha>` | Delete a saved session |
-| `/strip <sha>` | Keep text and title, removing the large KV payload |
-
-Compatible local KV snapshots avoid rebuilding the prompt. Stripped sessions
-and network TP restores require prefill. Sessions containing images cannot yet
-be saved. Saved conversations and traces may contain private information.
-
-For Pi, OpenCode, Codex CLI, or Claude Code, use `ds4-server` instead and follow
-the [client setup guide](docs/CLIENTS.md).
-
-### Models, images, and speculation
-
-[Models and vision](docs/MODELS.md) lists the supported downloads and memory
-requirements. DeepSeek Vision Experimental uses a different checkpoint from
-Flash 0731; GLM 5.3 Flash and Qwen3.8 Flash Next add vision to the same text
-model through a separate encoder.
-
-DeepSeek V4.1 Flash text and vision run on Metal; text also runs on a DGX Spark.
-Q2 runs with SSD streaming on one 128 GB Mac or Spark, or resident across two
-Macs or two Sparks using RDMA. Q4 needs SSD streaming or a 512 GB Mac.
-Engram tables remain on disk in every mode, so use a fast
-local SSD. See the [model guide](docs/MODELS.md#deepseek-v41-flash) for downloads
-and setup.
-
-With the matching encoder passed as `--vision FILE`, use `/read image.png`
-in the CLI or `view_image` in the native agent.
-
-Qwen3.8's smaller Q2 release has **41.73 GiB** of main/MTP weights,
-with imatrix IQ2_XXS gate/up experts and padded Q2_K down projections.
-It is the starting option for 64 GB Macs.
-The GGUF also contains 95.37 GiB of original BF16 n-grams, read directly
-from disk rather than loaded into RAM. Keep it on a fast SSD. Start with 8K context:
-
-```sh
-./download_model.sh qwen38-q2
-./ds4 --ctx 8192 --prefill-chunk 1024
-```
-
-The download fetches one 137.10 GiB file and updates `ds4flash.gguf`.
-Add `--mtp` for speculative decoding. The larger
-`qwen38-q4k` target is also available. Download the optional vision encoder
-with `./download_model.sh qwen38-vision` and pass it with `--vision`.
-See [Qwen setup](docs/QWEN38_FLASH_NEXT.md) for details.
-
-Speculative decoding is opt-in. GLM and Qwen use `--mtp`; V4 Flash DSpark needs a matching
-support GGUF. It can improve generation, but not every workload benefits.
-Read [speculative decoding](docs/SPECULATIVE_DECODING.md) for setup and the
-difference between default opportunistic sampling and `--mtp-exact-sampling`.
-
-### Output and power
-
-Thinking is enabled by default. Use `--nothink` or `/nothink` for direct
-answers, and `--think` or `/think` to enable it again.
-For V4.1, `ds4` and `ds4-agent` also accept
-`--think-level 25` or `/think 25`: 1 to 100 sets the reasoning effort, and
-0 disables thinking. `--think` selects 75, `--think-max` selects 100.
-Changing the level in a conversation rebuilds its cached prefix.
-The normal sampling defaults are temperature 1, top-p 1, and min-p 0.05;
-`--temp 0` selects greedy output.
-
-For DeepSeek V4, `--power N` trades throughput for lower sustained GPU load.
-The default is 100. V4.1 and GLM currently require `--power 100`.
-
-DeepSeek V4 Flash and GLM 5.3 Flash also support directional steering. Load a
-vector with `--dir-steering-file FILE`; `/steer F` adjusts its scale for
-subsequent tokens in a local CLI or agent session, without rebuilding the
-existing KV cache. See [steering documentation](dir-steering/README.md).
-
-`--prefix-file FILE` preloads complete `USER:` / `ASSISTANT:` pairs before
-the live conversation. A turn marker must start a line, roles must alternate,
-and the last turn must be `ASSISTANT:`.
-
-## Capability Evaluation
-
-`ds4-eval` runs embedded capability regression tests against a real GGUF.
-These are DwarfStar integration checks, not official leaderboard scores.
-
-```sh
-./ds4-eval -m ds4flash.gguf --trace /tmp/ds4-eval.txt
-./ds4-eval -m ds4flash.gguf --suite hard-smoke
-./ds4-eval -m ds4flash.gguf --suite hard --retry-incomplete
-```
-
-The default suite is `core`; `--suite all` runs core and hard cases.
-`--list-cases` lists tests without loading a model. `--plain` selects
-non-interactive output, and `--regrade-trace FILE` scores an existing trace
-without generating again. Sources and licenses are in [EVAL_DATA.md](EVAL_DATA.md).
-For inference correctness and release checks, read [testing](docs/TESTING.md).
-
-## Speed
-
-This recorded DeepSeek V4 Flash Q2 sweep uses an M5 Max with 128 GB RAM,
-2048-token continued-prefill intervals, and 128 greedy generation tokens per
-frontier. It is a baseline, not a fresh benchmark of every commit.
-
-![M5 Max Flash Q2 throughput](speed-bench/m5_max_ts.svg)
-
-See [performance and benchmarking](docs/PERFORMANCE.md) for the full numbers,
-DGX Spark results, comparison conditions, and benchmark commands.
-
-## Detailed Guides
-
-- [Models and vision](docs/MODELS.md): Flash, PRO, GLM, Qwen, and matching encoders.
-- [Qwen3.8 Flash Next](docs/QWEN38_FLASH_NEXT.md): model setup, MTP, vision, and validation.
-- [SSD streaming](docs/SSD_STREAMING.md): run larger than RAM and size the cache.
-- [Inference across machines](docs/DISTRIBUTED.md): two-Mac TP/RDMA and layer pipelines.
-- [Speculative decoding](docs/SPECULATIVE_DECODING.md): DSpark, GLM and Qwen MTP, and sampling.
-- [Serving](docs/SERVER.md): APIs, images, batching, and disk KV caches.
-- [Coding agent clients](docs/CLIENTS.md): Pi, OpenCode, Codex CLI, and Claude Code.
-- [Performance](docs/PERFORMANCE.md): reproducible measurements and recorded baselines.
-- [Testing and development](docs/TESTING.md): regression tests, debugging, and model-building tools.
-
-Read [CONTRIBUTING.md](CONTRIBUTING.md) before sending a pull request.
-
-## Logo
-
-The DwarfStar logo was designed by hand by Salvatore Sanfilippo, made more
-graphical with AI, and manually reworked by Ben Gnomino, whose human touch made
-it rock.
+上游 [antirez/ds4](https://github.com/antirez/ds4) 为 MIT，`LICENSE` 原样保留。
+本分支的本地改动同样按 MIT 提供。

@@ -3640,6 +3640,15 @@ int ds4_gpu_qwen4_argmax_tensor(ds4_gpu_tensor *out_idx, ds4_gpu_tensor *scratch
                                const ds4_gpu_tensor *logits, uint32_t n_vocab);
 /* M3 Ultra decode defaults; DS4_QWEN4_DECODE_FUSIONS=0 restores old paths. */
 int ds4_gpu_qwen4_decode_fusions_enabled(void);
+/* Widths the shared F32 tensor GEMM can take for Qwen prefill batches;
+ * returns 0 when the shape or size does not fit and the caller falls back. */
+int ds4_gpu_qwen4_f32_mm_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
+                                const void *model_map, uint64_t model_size, uint64_t weight_offset,
+                                uint32_t n_tok, uint32_t in_dim, uint32_t out_dim);
+/* Marks the forward that follows as a single-token decode step, whose
+ * dispatch sequence is replayed from an indirect command buffer.
+ * DS4_QWEN4_ICB=0 disables the replay. */
+void ds4_gpu_qwen4_replay_set(int enable);
 /* Single-token F16 injection: old_R/old_inj and next_R/inj_part must be distinct. */
 int ds4_gpu_qwen4_hc_combine_norm_tensor(
         ds4_gpu_tensor *next_R, const ds4_gpu_tensor *blk, const ds4_gpu_tensor *old_inj,

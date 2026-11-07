@@ -10168,6 +10168,11 @@ struct server {
     pthread_t *slot_threads;
     pthread_t decode_thread;
     int default_tokens;
+    /* Sampling used for request fields the client leaves out. */
+    float default_temperature;
+    float default_top_p;
+    float default_min_p;
+    int default_top_k;
     kv_disk_cache kv;
     tool_memory tool_mem;
     server_image_cache image_cache; /* Protected by inference_mu. */
@@ -10197,6 +10202,18 @@ struct server {
     pthread_mutex_t trace_mu;
     uint64_t trace_seq;
 };
+
+/* Server-level sampling defaults: a field the client left out falls back to the
+ * value given on the server command line instead of the built-in default.
+ * Anything the client sends explicitly still wins, so API semantics are
+ * unchanged for callers that do set these. */
+static void request_apply_sampling_defaults(request *r, const server *s) {
+    if (!r || !s) return;
+    if (!r->temperature_set) r->temperature = s->default_temperature;
+    if (!r->top_p_set) r->top_p = s->default_top_p;
+    if (!r->min_p_set) r->min_p = s->default_min_p;
+    if (!r->top_k_set) r->top_k = s->default_top_k;
+}
 
 static void server_inference_lock(server *s) {
     pthread_mutex_lock(&s->inference_mu);
@@ -13970,14 +13987,14 @@ decode_again:
         float top_p = j->req.top_p;
         float min_p = j->req.min_p;
         if (ds4_think_mode_enabled(j->req.think_mode)) {
-            /* Thinking keeps the fixed DeepSeek-style sampling defaults, but
-             * only for knobs the client left out: an explicit request value
-             * (e.g. temperature 0 from a benchmark harness) must win, or the
-             * same greedy request returns different text on every call. */
-            if (!j->req.temperature_set) temperature = DS4_DEFAULT_TEMPERATURE;
-            if (!j->req.top_k_set) top_k = 0;
-            if (!j->req.top_p_set) top_p = DS4_DEFAULT_TOP_P;
-            if (!j->req.min_p_set) min_p = DS4_DEFAULT_MIN_P;
+            /* Thinking keeps the server's sampling defaults, but only for knobs
+             * the client left out: an explicit request value (e.g. temperature 0
+             * from a benchmark harness) must win, or the same greedy request
+             * returns different text on every call. */
+            if (!j->req.temperature_set) temperature = s->default_temperature;
+            if (!j->req.top_k_set) top_k = s->default_top_k;
+            if (!j->req.top_p_set) top_p = s->default_top_p;
+            if (!j->req.min_p_set) min_p = s->default_min_p;
         }
         const bool greedy_tool_syntax = !thinking.inside && in_tool_call &&
             !dsml_decode_state_uses_payload_sampling(dsml_state);
@@ -15366,6 +15383,8 @@ static void *client_main(void *arg) {
         http_error(fd, s->enable_cors, 400, err);
         goto done;
     }
+    /* Fields the client omitted take the server's sampling defaults. */
+    request_apply_sampling_defaults(&req, s);
     if (!req.model_from_request) {
         free(req.model);
         req.model = xstrdup(server_model_id_from_engine(s->engine));
@@ -15453,6 +15472,11 @@ typedef struct {
     int port;
     int ctx_size;
     int default_tokens;
+    /* Sampling used for request fields the client leaves out. */
+    float default_temperature;
+    float default_top_p;
+    float default_min_p;
+    int default_top_k;
     const char *chdir_path;
     const char *trace_path;
     const char *kv_disk_dir;
@@ -15611,6 +15635,10 @@ static server_config parse_options(int argc, char **argv) {
         .port = 8000,
         .ctx_size = 32768,
         .default_tokens = 393216,
+        .default_temperature = DS4_DEFAULT_TEMPERATURE,
+        .default_top_p = DS4_DEFAULT_TOP_P,
+        .default_min_p = DS4_DEFAULT_MIN_P,
+        .default_top_k = 0,
         .tool_memory_max_ids = DS4_TOOL_MEMORY_DEFAULT_MAX_IDS,
         .mixed_prefill_quantum = 128,
     };
@@ -15691,6 +15719,22 @@ static server_config parse_options(int argc, char **argv) {
             c.ctx_size = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "-n") || !strcmp(arg, "--tokens")) {
             c.default_tokens = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--temp")) {
+            c.default_temperature =
+                parse_float_arg(need_arg(&i, argc, argv, arg), arg, 0.0f, 100.0f);
+        } else if (!strcmp(arg, "--top-p")) {
+            c.default_top_p =
+                parse_float_arg(need_arg(&i, argc, argv, arg), arg, 0.0f, 1.0f);
+        } else if (!strcmp(arg, "--min-p")) {
+            c.default_min_p =
+                parse_float_arg(need_arg(&i, argc, argv, arg), arg, 0.0f, 1.0f);
+        } else if (!strcmp(arg, "--top-k")) {
+            c.default_top_k = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+            if (c.default_top_k < 0 || c.default_top_k > 1024) {
+                server_log(DS4_LOG_DEFAULT,
+                           "ds4-server: --top-k must be between 0 and 1024");
+                exit(2);
+            }
         } else if (!strcmp(arg, "-t") || !strcmp(arg, "--threads")) {
             c.engine.n_threads = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--chdir")) {
@@ -15981,6 +16025,10 @@ int main(int argc, char **argv) {
     s.mixed_prefill_quantum = cfg.mixed_prefill_quantum;
     s.last_prefill_slot = slot_count - 1;
     s.default_tokens = cfg.default_tokens;
+    s.default_temperature = cfg.default_temperature;
+    s.default_top_p = cfg.default_top_p;
+    s.default_min_p = cfg.default_min_p;
+    s.default_top_k = cfg.default_top_k;
     s.disable_exact_dsml_tool_replay = cfg.disable_exact_dsml_tool_replay;
     s.tool_mem.max_entries = cfg.tool_memory_max_ids;
     s.enable_cors = cfg.enable_cors;
@@ -16101,6 +16149,9 @@ int main(int argc, char **argv) {
     }
     g_listen_fd = lfd;
     server_log(DS4_LOG_DEFAULT, "ds4-server: listening on http://%s:%d", cfg.host, cfg.port);
+    server_log(DS4_LOG_DEFAULT,
+               "ds4-server: request sampling defaults: temperature %.2f, top_p %.2f, top_k %d, min_p %.2f",
+               s.default_temperature, s.default_top_p, s.default_top_k, s.default_min_p);
 
     while (!g_stop_requested) {
         int fd = accept(lfd, NULL, NULL);
@@ -18177,6 +18228,51 @@ static void test_request_defaults_use_min_p_filtering(void) {
     TEST_ASSERT(r.top_k == 0);
     TEST_ASSERT(r.min_p == DS4_DEFAULT_MIN_P);
     TEST_ASSERT(!r.ignore_eos);
+    request_free(&r);
+}
+
+static void test_request_server_sampling_defaults(void) {
+    server s;
+    memset(&s, 0, sizeof(s));
+    s.default_temperature = 1.0f;
+    s.default_top_p = 0.95f;
+    s.default_min_p = 0.0f;
+    s.default_top_k = 20;
+
+    /* Omitted fields take the server command-line values. */
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    request_apply_sampling_defaults(&r, &s);
+    TEST_ASSERT(r.temperature == 1.0f);
+    TEST_ASSERT(r.top_p == 0.95f);
+    TEST_ASSERT(r.min_p == 0.0f);
+    TEST_ASSERT(r.top_k == 20);
+    request_free(&r);
+
+    /* Explicit request values still win. */
+    request_init(&r, REQ_CHAT, 128);
+    r.temperature = 0.0f;
+    r.temperature_set = true;
+    r.top_p = 0.5f;
+    r.top_p_set = true;
+    r.min_p = 0.01f;
+    r.min_p_set = true;
+    r.top_k = 5;
+    r.top_k_set = true;
+    request_apply_sampling_defaults(&r, &s);
+    TEST_ASSERT(r.temperature == 0.0f);
+    TEST_ASSERT(r.top_p == 0.5f);
+    TEST_ASSERT(r.min_p == 0.01f);
+    TEST_ASSERT(r.top_k == 5);
+    request_free(&r);
+
+    /* A NULL server (unit tests, non-HTTP callers) leaves requests untouched. */
+    request_init(&r, REQ_CHAT, 128);
+    request_apply_sampling_defaults(&r, NULL);
+    TEST_ASSERT(r.temperature == DS4_DEFAULT_TEMPERATURE);
+    TEST_ASSERT(r.top_p == DS4_DEFAULT_TOP_P);
+    TEST_ASSERT(r.min_p == DS4_DEFAULT_MIN_P);
+    TEST_ASSERT(r.top_k == 0);
     request_free(&r);
 }
 
@@ -23034,6 +23130,7 @@ static void ds4_server_unit_tests_run(void) {
     test_slot_routing_staleness_tiers();
     test_dispatch_routes_alien_request_to_empty_slot();
     test_request_defaults_use_min_p_filtering();
+    test_request_server_sampling_defaults();
     test_chat_ignore_eos_contract();
     test_reasoning_effort_mapping();
     test_model_alias_thinking_controls();
